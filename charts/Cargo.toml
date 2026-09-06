@@ -1,0 +1,13 @@
+[package]
+name = "charts"
+version = "0.1.0"
+edition = "2021"
+description = "Chart generation for cmapss-rul-prediction sanity checks (not part of the core pipeline)"
+
+[dependencies]
+cmapss-rul-prediction = { path = "../core" }
+# Rendering pixels/text is plumbing, not differentiating logic, so it's
+# used rather than hand-rolled - see the core crate's Cargo.toml for why
+# this is isolated to its own workspace member instead of living alongside
+# the zero-dependency pipeline.
+plotters = "0.3"

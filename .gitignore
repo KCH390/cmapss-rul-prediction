@@ -4,3 +4,4 @@
 # consistent with the "generated data is gitignored" convention used across
 # the other portfolio projects.
 /data/processed
+/reports/figures/*.png

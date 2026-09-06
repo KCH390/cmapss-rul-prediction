@@ -1,0 +1,24 @@
+[package]
+name = "cmapss-rul-prediction"
+version = "0.1.0"
+edition = "2021"
+description = "Remaining Useful Life (RUL) prediction for NASA C-MAPSS turbofan engines"
+authors = ["Kerry"]
+
+[dependencies]
+# Genuinely zero external dependencies: parsing, RUL labeling, windowed
+# features, statistics, and CLI arg handling are all hand-rolled (see
+# README "Dependency philosophy"). This is enforced structurally, not just
+# by convention - plotters (used only for chart generation) lives in the
+# separate `charts` workspace member, specifically so it can't pull a
+# graphics/font stack into this crate's build graph. `cargo build` or
+# `cargo test` from this directory alone never touches plotters or its
+# dependencies.
+
+[[bin]]
+name = "cmapss-rul"
+path = "src/main.rs"
+
+[lib]
+name = "cmapss_rul"
+path = "src/lib.rs"
