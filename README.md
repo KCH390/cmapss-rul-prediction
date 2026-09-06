@@ -204,34 +204,37 @@ cmapss-rul-prediction/
 ## Running it
 
 All commands below assume you're in the workspace root (this directory).
+Plain `cargo run`/`cargo build`/`cargo test` default to the core pipeline
+(no `-p` needed) — see the `default-members` note in the root `Cargo.toml`.
 
 ```bash
 # Full report for all four subsets, writes labeled + windowed-feature CSVs to data/processed/
-cargo run -p cmapss-rul-prediction
+cargo run
 
 # One subset, report only (no CSV output)
-cargo run -p cmapss-rul-prediction -- fd002 --report-only
+cargo run -- fd002 --report-only
 
 # Custom RUL cap or window size
-cargo run -p cmapss-rul-prediction -- fd001 --rul-cap 130 --window 15
+cargo run -- fd001 --rul-cap 130 --window 15
 
-# Sanity-check charts -> reports/figures/
+# Sanity-check charts -> reports/figures/ (explicit -p: not a default member,
+# so plain `cargo build`/`cargo run` never touches its plotters/font-kit deps)
 cargo run -p charts
 ```
 
 ## Testing
 
 ```bash
-# Core pipeline only - genuinely zero dependencies, fast, no graphics stack involved
-cargo test -p cmapss-rul-prediction
+# Defaults to the core pipeline - genuinely zero dependencies, fast, no graphics stack involved
+cargo test
 ```
 
 24 tests (16 unit, 8 integration), all running against the real checked-in
 dataset (no synthetic fixtures for the integration tests) — unit-count
 sanity checks against the readme (including the corrected FD004 numbers),
 RUL monotonicity and cap enforcement, test-set RUL reconstruction against
-ground truth, full parse coverage across all 8 train/test files, and (new
-in Phase 2) window-size safety margin and structural leakage checks.
+ground truth, full parse coverage across all 8 train/test files, and window-size
+safety margin and structural leakage checks.
 
 ## Roadmap
 
