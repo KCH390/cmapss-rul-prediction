@@ -10,8 +10,8 @@ industrial reliability engineering — "how much running time is left before
 this fails" — which is a regression problem, not a classification one, and
 uses this repo to explore that in a systems language instead of Python.
 
-**Status: Phase 2 of 6 — rolling-window feature engineering.** No modeling
-yet; see [Roadmap](#roadmap).
+**Status: Phase 3 of 6 — baseline models (linear regression, random forest).**
+See [Roadmap](#roadmap).
 
 ## Dataset
 
@@ -123,17 +123,88 @@ window is safe. Cycles before an engine's first full window are dropped
 entirely (not computed from a partial window) since a std dev or slope
 from 1-2 points isn't meaningful.
 
+## Phase 3: baseline models
+
+Two standard regressors — linear regression (`linfa`) and random forest
+(`smartcore`) — evaluated on FD001 and FD003 (the two single-condition
+subsets; FD002/FD004 wait for Phase 5's regime normalization, since running
+them now would just be measuring how much the untreated multi-condition
+noise hurts, not how good the model is). No hyperparameter tuning yet —
+these are floor numbers, meant to be beaten by Phase 4's hand-built model.
+
+**Evaluation methodology, which is easy to get wrong:** training pools every
+windowed row of every training engine (normal data augmentation for this
+task — ~20-24k rows). Evaluation uses exactly **one row per test engine**:
+the window ending at that engine's last recorded cycle, since that's what
+the official PHM08 protocol actually scores — one RUL prediction per
+engine, made at the point its data was truncated. Scoring every windowed
+row of a test trajectory would inflate apparent performance, since
+consecutive windows from the same engine are highly correlated.
+
+**Feature selection** excludes whichever sensors that subset's own EDA
+flagged as near-constant back in Phase 1/2 — 6 sensors for FD001, 5 for
+FD003 (see the EDA table above) — leaving 60-64 features (raw/mean/std/slope
+× the remaining sensors). This is Phase 1's findings directly feeding Phase
+3's modeling, not two disconnected steps. Operational settings are excluded
+for every subset; see `core/src/design_matrix.rs` for why.
+
+Results (no tuning, `--window 10`, `--rul-cap 125`):
+
+| Subset | Model | RMSE (cycles) | PHM08 score | Late / early |
+|--------|-------|---------------|-------------|--------------|
+| FD001  | Linear regression | 20.45 | 1100.1 | 62 / 38 |
+| FD001  | Random forest      | **19.39** | 1501.2 | 58 / 42 |
+| FD003  | Linear regression | 19.94 | **1400.2** | 64 / 36 |
+| FD003  | Random forest      | 20.42 | 2031.8 | 60 / 40 |
+
+**A real, worth-explaining disagreement**: on FD001, random forest has the
+*better* RMSE (19.39 vs 20.45) but the *worse* PHM08 score (1501.2 vs
+1100.1). Its worst 3 test-set errors are all late (+60.5, +55.7, +52.7 —
+predicting more remaining life than the engine actually had), while linear
+regression's worst 3 split between directions. Since PHM08 scoring
+penalizes late errors exponentially (divisor 10) more steeply than early
+ones (divisor 13), a handful of large late outliers can dominate the sum
+even when the model's *average* error is smaller — exactly the score's
+known outlier sensitivity discussed in the literature, and why RMSE gets
+reported alongside it rather than instead of it. This isn't a bug to fix;
+it's the reason both metrics matter, and it's a fair preview of what
+permutation importance / error analysis in a later phase should dig into
+for random forest specifically.
+
+Run it yourself:
+
+```bash
+cargo run -p models --release           # FD001 by default
+cargo run -p models --release -- fd003
+```
+
+**Use `--release`.** A debug build spent 2.5+ minutes at 100% CPU on this
+(random forest training on ~20k rows × 60 features is real numeric work);
+release finishes in a couple of seconds. This isn't a Rust-specific gotcha,
+but it's an easy one to hit coming from Python, where `import sklearn`
+gives you optimized code regardless of how your own script is invoked.
+
+Predictions are written to `data/processed/{subset}_test_predictions.csv`
+(unit, true RUL, both models' predictions, both errors) for further
+analysis.
+
 ## Charting
 
-Static sanity-check charts (raw sensor trace vs. rolling mean, RUL label
-shape) live in a separate `charts` crate — see [Project structure](#project-structure)
-for why it's isolated. Generate them with:
+Static sanity-check charts live in a separate `charts` crate — see
+[Project structure](#project-structure) for why it's isolated. Generate
+them with:
 
 ```bash
 cargo run -p charts
 ```
 
-This writes PNGs to `reports/figures/`.
+This writes several PNGs to `reports/figures/` for FD001: a bar chart of
+each sensor's Pearson correlation with RUL, raw-vs-rolling-mean charts for
+the 3 most-correlated sensors, one more for the sensor with the *highest
+raw variance* (kept deliberately, even though it isn't top-3 by
+correlation — high variance and high relevance turned out to be different
+things, and the chart makes that visible instead of quietly picking a
+better sensor), and the piecewise-linear RUL label shape.
 
 **On notebooks:** the natural instinct for exploratory charting is a Jupyter
 notebook, and there's a genuinely "rusty" way to get one — [`evcxr_jupyter`](https://github.com/evcxr/evcxr),
@@ -156,32 +227,36 @@ is the fallback - plain PNGs, zero notebook tooling, still 100% Rust.
 
 **The core pipeline (`core/`) has zero external dependencies**, enforced
 structurally rather than by convention: it's a separate workspace member
-from `charts/`, so nothing charting-related can end up in its dependency
-tree even by accident. Parsing, RUL labeling, windowed features, summary
-statistics, and CLI argument handling are all hand-rolled. A CLI crate
-(`clap`) would normally be the idiomatic, unremarkable choice for argument
-parsing — but this CLI's surface is small enough (one positional enum, a
-few flags) that `std::env::args()` covers it without pulling in a dependency
-for plumbing.
+from `charts/` and `models/`, so nothing charting- or ML-library-related
+can end up in its dependency tree even by accident. Parsing, RUL labeling,
+windowed features, summary statistics, evaluation metrics, and CLI argument
+handling are all hand-rolled. A CLI crate (`clap`) would normally be the
+idiomatic, unremarkable choice for argument parsing — but every CLI in this
+workspace has a small enough surface (one positional enum, a few flags)
+that `std::env::args()` covers it without pulling in a dependency for
+plumbing.
 
-`plotters` (in the separate `charts` crate) is the one deliberate exception:
-rendering pixels and text is genuinely plumbing, not differentiating logic.
-Later pipeline phases will pull in crates where they're actually earning
-their place too (e.g. `linfa`/`smartcore` for baseline models in Phase 3) —
-see the hybrid approach in the Roadmap.
+`plotters` (in `charts/`) and `linfa`/`smartcore` (in `models/`) are the
+deliberate exceptions — the agreed hybrid approach: crates for
+well-understood, standard algorithms (linear regression, random forest,
+rendering pixels), hand-rolled code for the logic that's actually
+differentiating for this project (RUL labeling, the PHM08 scoring function,
+feature engineering, and — coming in Phase 4 — gradient-boosted trees built
+from scratch).
 
 ## Project structure
 
-This is a Cargo workspace with two members, split specifically so the
-`plotters`/`font-kit` graphics stack can't leak into the core pipeline's
-dependency graph (see [Dependency philosophy](#dependency-philosophy)):
+This is a Cargo workspace with three members, split specifically so the
+`plotters`/`font-kit` graphics stack and the `linfa`/`smartcore` ML crates
+can't leak into the core pipeline's dependency graph (see
+[Dependency philosophy](#dependency-philosophy)):
 
 ```
 cmapss-rul-prediction/
-├── Cargo.toml                 # workspace root
+├── Cargo.toml                 # workspace root (default-members = ["core"])
 ├── data/
 │   ├── raw/CMAPSSData/         # the 12 original NASA files + readme (checked in)
-│   └── processed/              # labeled + windowed-feature CSVs, generated by `cargo run` (gitignored)
+│   └── processed/              # labeled/windowed/prediction CSVs, generated by `cargo run` (gitignored)
 ├── reports/figures/            # charts, generated by `cargo run -p charts` (gitignored)
 ├── core/                        # the actual pipeline - zero external dependencies
 │   ├── Cargo.toml
@@ -193,10 +268,15 @@ cmapss-rul-prediction/
 │   │   ├── loader.rs              # file I/O + grouping into EngineRun trajectories
 │   │   ├── rul.rs                  # piecewise-linear RUL labeling (train + test)
 │   │   ├── features.rs             # rolling-window feature engineering (Phase 2)
-│   │   └── eda.rs                  # cycle-length and sensor-variance statistics
+│   │   ├── design_matrix.rs        # flat feature vectors for ML libraries (Phase 3)
+│   │   ├── scoring.rs               # RMSE + PHM08 asymmetric scoring function (Phase 3)
+│   │   └── eda.rs                  # cycle-length, sensor-variance, sensor-RUL correlation
 │   │   └── error.rs                 # hand-rolled error type
 │   └── tests/data_integrity.rs   # integration tests against the real files
-└── charts/                       # sanity-check chart generation (plotters lives only here)
+├── charts/                       # sanity-check chart generation (plotters lives only here)
+│   ├── Cargo.toml
+│   └── src/main.rs
+└── models/                       # baseline models (linfa + smartcore live only here)
     ├── Cargo.toml
     └── src/main.rs
 ```
@@ -220,27 +300,32 @@ cargo run -- fd001 --rul-cap 130 --window 15
 # Sanity-check charts -> reports/figures/ (explicit -p: not a default member,
 # so plain `cargo build`/`cargo run` never touches its plotters/font-kit deps)
 cargo run -p charts
+
+# Baseline models (explicit -p, same reason). Use --release - see Phase 3 section.
+cargo run -p models --release
+cargo run -p models --release -- fd003
 ```
 
 ## Testing
 
 ```bash
-# Defaults to the core pipeline - genuinely zero dependencies, fast, no graphics stack involved
+# Defaults to the core pipeline - genuinely zero dependencies, fast, no graphics/ML stack involved
 cargo test
 ```
 
-24 tests (16 unit, 8 integration), all running against the real checked-in
+36 tests (28 unit, 8 integration), all running against the real checked-in
 dataset (no synthetic fixtures for the integration tests) — unit-count
 sanity checks against the readme (including the corrected FD004 numbers),
 RUL monotonicity and cap enforcement, test-set RUL reconstruction against
-ground truth, full parse coverage across all 8 train/test files, and window-size
-safety margin and structural leakage checks.
+ground truth, full parse coverage across all 8 train/test files, window-size
+safety margin and structural leakage checks, and (new in Phase 3) scoring
+function correctness and feature-vector construction.
 
 ## Roadmap
 
 1. ~~Scaffold, data loading, RUL labeling, EDA~~ (Phase 1)
-2. ~~Feature engineering: rolling-window statistics per sensor per engine, run-aware to prevent cross-engine leakage~~ (this phase)
-3. Baseline models (crates: `linfa` linear regression, `smartcore` random forest), evaluated on RMSE and NASA's official asymmetric scoring function
+2. ~~Feature engineering: rolling-window statistics per sensor per engine, run-aware to prevent cross-engine leakage~~ (Phase 2)
+3. ~~Baseline models (`linfa` linear regression, `smartcore` random forest), evaluated on RMSE and NASA's official asymmetric scoring function~~ (this phase)
 4. Flagship model: gradient-boosted regression trees, hand-built from scratch
 5. Generalization to FD002/FD004: operating-condition clustering + per-regime normalization, documented as an explicit extension (see EDA findings above)
 6. *(stretch)* Sequence modeling (LSTM via `candle`/`burn`), the literature-standard approach for this dataset

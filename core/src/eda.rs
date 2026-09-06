@@ -86,6 +86,56 @@ pub fn near_constant_sensors(stats: &[SensorStats; NUM_SENSORS]) -> Vec<usize> {
         .collect()
 }
 
+/// Pearson correlation between each sensor's raw reading and the labeled
+/// RUL, pooled across every cycle of every run passed in.
+///
+/// This is a cheap, honest way to rank sensors by "does this actually move
+/// with degradation" rather than by raw variance — a sensor can be noisy
+/// (high variance) without carrying any information about remaining life,
+/// and vice versa. It's not a substitute for real feature importance from
+/// a trained model (see the `models` crate), just a fast sanity check.
+///
+/// `runs` and `labels` must be the same length and in the same order (one
+/// label vector per run, e.g. the output of `rul::label_train_rul`).
+///
+/// Sensors with ~zero variance (see `NEAR_CONSTANT_STD_THRESHOLD`) get a
+/// correlation of exactly `0.0` rather than a numerically unstable ratio -
+/// there's no meaningful correlation to compute when the denominator is
+/// effectively zero.
+pub fn sensor_rul_correlation(runs: &[EngineRun], labels: &[Vec<u32>]) -> [f64; NUM_SENSORS] {
+    assert_eq!(runs.len(), labels.len(), "one label vector required per run");
+
+    let mut xs: [Vec<f64>; NUM_SENSORS] = std::array::from_fn(|_| Vec::new());
+    let mut ys: Vec<f64> = Vec::new();
+
+    for (run, run_labels) in runs.iter().zip(labels.iter()) {
+        for (record, &rul) in run.records.iter().zip(run_labels.iter()) {
+            for s in 0..NUM_SENSORS {
+                xs[s].push(record.sensors[s]);
+            }
+            ys.push(rul as f64);
+        }
+    }
+
+    let n = ys.len() as f64;
+    let y_mean = ys.iter().sum::<f64>() / n;
+    let y_var: f64 = ys.iter().map(|y| (y - y_mean).powi(2)).sum();
+
+    let mut correlations = [0.0; NUM_SENSORS];
+    for s in 0..NUM_SENSORS {
+        let x_mean = xs[s].iter().sum::<f64>() / n;
+        let mut cov = 0.0;
+        let mut x_var = 0.0;
+        for (x, y) in xs[s].iter().zip(ys.iter()) {
+            cov += (x - x_mean) * (y - y_mean);
+            x_var += (x - x_mean).powi(2);
+        }
+        let denom = (x_var * y_var).sqrt();
+        correlations[s] = if denom < 1e-9 { 0.0 } else { cov / denom };
+    }
+    correlations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +182,32 @@ mod tests {
         let stats = sensor_stats(&[run]);
         assert!(stats[0].std_dev > NEAR_CONSTANT_STD_THRESHOLD);
         assert_eq!(near_constant_sensors(&stats), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn perfectly_correlated_sensor_scores_near_one() {
+        // sensor value == rul exactly -> correlation should be ~1.0
+        let run = run_with_sensor_values(1, &[40.0, 30.0, 20.0, 10.0, 0.0]);
+        let labels = vec![vec![40, 30, 20, 10, 0]];
+        let corr = sensor_rul_correlation(&[run], &labels);
+        assert!((corr[0] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inversely_correlated_sensor_scores_near_negative_one() {
+        let run = run_with_sensor_values(1, &[0.0, 10.0, 20.0, 30.0, 40.0]);
+        let labels = vec![vec![40, 30, 20, 10, 0]];
+        let corr = sensor_rul_correlation(&[run], &labels);
+        assert!((corr[0] - (-1.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn constant_sensor_correlates_at_exactly_zero_not_nan() {
+        let run = run_with_sensor_values(1, &[5.0, 5.0, 5.0, 5.0]);
+        let labels = vec![vec![30, 20, 10, 0]];
+        let corr = sensor_rul_correlation(&[run], &labels);
+        assert_eq!(corr[0], 0.0);
+        assert!(!corr[0].is_nan());
     }
 
     #[test]

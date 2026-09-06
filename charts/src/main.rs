@@ -13,10 +13,23 @@ use std::path::Path;
 use plotters::prelude::*;
 
 use cmapss_rul::dataset::Subset;
-use cmapss_rul::eda::sensor_stats;
-use cmapss_rul::features::{compute_windowed_features, DEFAULT_WINDOW};
+use cmapss_rul::eda::sensor_rul_correlation;
+use cmapss_rul::features::{compute_windowed_features, WindowedFeatures, DEFAULT_WINDOW};
 use cmapss_rul::loader::{group_by_unit, load_records, EngineRun};
+use cmapss_rul::parser::NUM_SENSORS;
 use cmapss_rul::rul::{label_train_rul, DEFAULT_RUL_CAP};
+
+/// Sensor kept from the original Phase 2 chart on purpose: it has the
+/// *highest raw variance* in FD001's training set, which made it look like
+/// an obvious pick for a "does the rolling mean smooth the signal" demo.
+/// It turned out to have almost no correlation with RUL - noisy, not
+/// informative. Charting it deliberately alongside the top-correlated
+/// sensors makes that contrast visible instead of quietly picking a
+/// better sensor and losing the lesson.
+const HIGH_VARIANCE_LOW_RELEVANCE_SENSOR: usize = 9;
+
+/// How many top-correlated sensors to chart individually.
+const TOP_N_SENSORS_TO_CHART: usize = 3;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = Path::new("data/raw/CMAPSSData");
@@ -27,49 +40,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let train_records = load_records(&subset.train_path(data_dir))?;
     let train_runs = group_by_unit(train_records);
 
-    // Pick the sensor with the highest variance so the chart actually shows
-    // something - not hard-coded, computed the same way Phase 1's EDA report does.
-    let stats = sensor_stats(&train_runs);
-    let most_variable = stats
+    let labels: Vec<Vec<u32>> = train_runs
         .iter()
-        .max_by(|a, b| a.std_dev.partial_cmp(&b.std_dev).unwrap())
-        .unwrap();
-    let sensor_idx = most_variable.index - 1; // stats.index is 1-based
+        .map(|run| label_train_rul(run, DEFAULT_RUL_CAP))
+        .collect();
+
+    let correlations = sensor_rul_correlation(&train_runs, &labels);
+
+    // Rank sensors by |correlation| with RUL, descending.
+    let mut ranked: Vec<(usize, f64)> = correlations
+        .iter()
+        .enumerate()
+        .map(|(idx, &c)| (idx + 1, c)) // 1-indexed sensor number
+        .collect();
+    ranked.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+
+    println!("Sensor-RUL correlation ranking (FD001 training set):");
+    for (sensor_num, corr) in &ranked {
+        println!("  sensor {:>2}: {:+.3}", sensor_num, corr);
+    }
+
+    draw_correlation_bar_chart(&correlations, &out_dir.join("FD001_sensor_rul_correlation.png"))?;
 
     // Pick the longest-running engine for the clearest visual.
     let longest_run = train_runs
         .iter()
         .max_by_key(|r| r.last_cycle())
         .expect("no runs loaded");
+    let run_labels = label_train_rul(longest_run, DEFAULT_RUL_CAP);
+    let windowed = compute_windowed_features(longest_run, &run_labels, DEFAULT_WINDOW);
 
-    println!(
-        "charting {} unit {} (run length {} cycles), sensor {} (std dev {:.3}, the most variable in the training set)",
-        subset,
-        longest_run.unit,
-        longest_run.last_cycle(),
-        most_variable.index,
-        most_variable.std_dev
-    );
-
-    let labels = label_train_rul(longest_run, DEFAULT_RUL_CAP);
-    let windowed = compute_windowed_features(longest_run, &labels, DEFAULT_WINDOW);
-
-    draw_raw_vs_rolling_mean(
-        longest_run,
-        sensor_idx,
-        &windowed,
-        most_variable.index,
-        &out_dir.join(format!(
-            "{}_unit{}_sensor{}_rolling.png",
-            subset.code(),
+    // Chart the top-N most correlated sensors...
+    let mut charted: Vec<usize> = Vec::new();
+    for &(sensor_num, corr) in ranked.iter().take(TOP_N_SENSORS_TO_CHART) {
+        println!(
+            "charting {} unit {}, sensor {} (corr with RUL: {:+.3}, ranked #{} by |correlation|)",
+            subset,
             longest_run.unit,
-            most_variable.index
-        )),
-    )?;
+            sensor_num,
+            corr,
+            charted.len() + 1
+        );
+        draw_raw_vs_rolling_mean(
+            longest_run,
+            sensor_num,
+            &windowed,
+            corr,
+            &out_dir.join(format!(
+                "{}_unit{}_sensor{}_rolling.png",
+                subset.code(),
+                longest_run.unit,
+                sensor_num
+            )),
+        )?;
+        charted.push(sensor_num);
+    }
+
+    // ...plus the high-variance-but-uninformative sensor, for contrast, if
+    // it wasn't already in the top N.
+    if !charted.contains(&HIGH_VARIANCE_LOW_RELEVANCE_SENSOR) {
+        let corr = correlations[HIGH_VARIANCE_LOW_RELEVANCE_SENSOR - 1];
+        println!(
+            "charting {} unit {}, sensor {} (corr with RUL: {:+.3}) - highest raw variance in the \
+             training set, kept as a contrast: high variance is not the same as high relevance",
+            subset, longest_run.unit, HIGH_VARIANCE_LOW_RELEVANCE_SENSOR, corr
+        );
+        draw_raw_vs_rolling_mean(
+            longest_run,
+            HIGH_VARIANCE_LOW_RELEVANCE_SENSOR,
+            &windowed,
+            corr,
+            &out_dir.join(format!(
+                "{}_unit{}_sensor{}_rolling.png",
+                subset.code(),
+                longest_run.unit,
+                HIGH_VARIANCE_LOW_RELEVANCE_SENSOR
+            )),
+        )?;
+    }
 
     draw_rul_shape(
         longest_run,
-        &labels,
+        &run_labels,
         &out_dir.join(format!("{}_unit{}_rul_shape.png", subset.code(), longest_run.unit)),
     )?;
 
@@ -77,13 +129,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn draw_raw_vs_rolling_mean(
-    run: &EngineRun,
-    sensor_idx: usize,
-    windowed: &[cmapss_rul::features::WindowedFeatures],
-    sensor_number: usize,
+fn draw_correlation_bar_chart(
+    correlations: &[f64; NUM_SENSORS],
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let root = BitMapBackend::new(path, (1000, 500)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption(
+            "FD001: Pearson correlation of each sensor with labeled RUL",
+            ("sans-serif", 22),
+        )
+        .margin(15)
+        .x_label_area_size(35)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0.5f64..(NUM_SENSORS as f64 + 0.5), -1.05f64..1.05f64)?;
+
+    chart
+        .configure_mesh()
+        .x_desc("sensor number")
+        .y_desc("correlation with RUL")
+        .x_labels(NUM_SENSORS)
+        .x_label_formatter(&|x| format!("{}", *x as i32))
+        .draw()?;
+
+    chart.draw_series(correlations.iter().enumerate().map(|(idx, &corr)| {
+        let x = (idx + 1) as f64;
+        let color = if corr >= 0.0 { BLUE.filled() } else { RED.filled() };
+        Rectangle::new([(x - 0.35, 0.0), (x + 0.35, corr)], color)
+    }))?;
+
+    root.present()?;
+    Ok(())
+}
+
+fn draw_raw_vs_rolling_mean(
+    run: &EngineRun,
+    sensor_number: usize, // 1-indexed
+    windowed: &[WindowedFeatures],
+    correlation: f64,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sensor_idx = sensor_number - 1;
     let root = BitMapBackend::new(path, (960, 540)).into_drawing_area();
     root.fill(&WHITE)?;
 
@@ -105,10 +193,10 @@ fn draw_raw_vs_rolling_mean(
     let mut chart = ChartBuilder::on(&root)
         .caption(
             format!(
-                "Unit {} - sensor {} raw vs. {}-cycle rolling mean",
-                run.unit, sensor_number, DEFAULT_WINDOW
+                "Unit {} - sensor {} raw vs. {}-cycle rolling mean (corr with RUL: {:+.3})",
+                run.unit, sensor_number, DEFAULT_WINDOW, correlation
             ),
-            ("sans-serif", 22),
+            ("sans-serif", 20),
         )
         .margin(15)
         .x_label_area_size(35)

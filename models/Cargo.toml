@@ -1,0 +1,16 @@
+[package]
+name = "models"
+version = "0.1.0"
+edition = "2021"
+description = "Baseline RUL models (linear regression, random forest) for cmapss-rul-prediction"
+
+[dependencies]
+cmapss-rul-prediction = { path = "../core" }
+# Standard-algorithm baselines only - crates used here rather than hand-rolled,
+# per the agreed hybrid approach (see README Roadmap): well-understood
+# off-the-shelf models to establish a floor before Phase 4's hand-built
+# gradient-boosted trees.
+linfa = "0.7"
+linfa-linear = "0.7"
+smartcore = "0.3"
+ndarray = "0.15"
