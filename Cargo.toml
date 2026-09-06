@@ -1,0 +1,22 @@
+[package]
+name = "cmapss-rul-prediction"
+version = "0.1.0"
+edition = "2021"
+description = "Remaining Useful Life (RUL) prediction for NASA C-MAPSS turbofan engines"
+authors = ["Kerry"]
+
+[dependencies]
+# Phase 1 has zero external dependencies: parsing, RUL labeling, statistics,
+# and CLI arg handling are all hand-rolled (see README "Dependency philosophy").
+# A CLI parsing crate (clap) would normally be a reasonable, idiomatic choice
+# here since arg parsing isn't the interesting/differentiating logic for this
+# project - but this project's CLI surface is small enough (one positional
+# enum, two flags) that std::env::args() covers it without the dependency.
+
+[[bin]]
+name = "cmapss-rul"
+path = "src/main.rs"
+
+[lib]
+name = "cmapss_rul"
+path = "src/lib.rs"

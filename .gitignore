@@ -1,0 +1,6 @@
+/target
+
+# Deterministically regenerated from data/raw/ + `cargo run` — not checked in,
+# consistent with the "generated data is gitignored" convention used across
+# the other portfolio projects.
+/data/processed
