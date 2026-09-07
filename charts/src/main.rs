@@ -17,9 +17,9 @@ use cmapss_rul::dataset::Subset;
 use cmapss_rul::design_matrix::to_feature_vector;
 use cmapss_rul::eda::{near_constant_sensors, sensor_rul_correlation, sensor_stats};
 use cmapss_rul::features::{compute_windowed_features, WindowedFeatures, DEFAULT_WINDOW};
-use cmapss_rul::loader::{group_by_unit, load_records, EngineRun};
+use cmapss_rul::loader::{group_by_unit, load_records, load_rul, EngineRun};
 use cmapss_rul::parser::NUM_SENSORS;
-use cmapss_rul::rul::{label_train_rul, DEFAULT_RUL_CAP};
+use cmapss_rul::rul::{label_test_rul, label_train_rul, DEFAULT_RUL_CAP};
 use cmapss_rul::tree::TreeParams;
 
 /// Sensor kept from the original Phase 2 chart on purpose: it has the
@@ -149,6 +149,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let model = GradientBoostedTrees::fit(&x_train, &y_train, &gbm_params);
     draw_training_curve(&model.training_rmse, &out_dir.join(format!("{}_flagship_training_curve.png", subset.code())))?;
+
+    // --- Phase 4 (extended): prediction effectiveness on the test set ---
+    // Same evaluation protocol as the `flagship` binary: one prediction per
+    // test engine, at the window ending on its last recorded cycle - not
+    // every windowed row, which would inflate apparent performance. Uses
+    // the same model instance already fit above, so this is guaranteed to
+    // match whatever `flagship`'s own report would print for these
+    // hyperparameters, not a separately-computed approximation.
+    println!("evaluating the flagship GBM on the test set to chart prediction effectiveness...");
+    let test_runs = group_by_unit(load_records(&subset.test_path(data_dir))?);
+    let test_rul_ground_truth = load_rul(&subset.rul_path(data_dir))?;
+
+    let mut test_pairs: Vec<(f64, f64)> = Vec::new(); // (predicted, true)
+    for (run, &final_rul) in test_runs.iter().zip(test_rul_ground_truth.iter()) {
+        let test_labels = label_test_rul(run, final_rul, DEFAULT_RUL_CAP);
+        let windowed = compute_windowed_features(run, &test_labels, DEFAULT_WINDOW);
+        let last = windowed.last().expect("every test unit must yield >=1 windowed row");
+        let x = to_feature_vector(last, &excluded);
+        let pred = model.predict(&x);
+        test_pairs.push((pred, last.rul as f64));
+    }
+    let test_rmse = cmapss_rul::scoring::rmse(&test_pairs);
+    println!("test RMSE for the charted model: {:.2} cycles ({} test engines)", test_rmse, test_pairs.len());
+
+    draw_predicted_vs_actual(
+        &test_pairs,
+        test_rmse,
+        &out_dir.join(format!("{}_flagship_predicted_vs_actual.png", subset.code())),
+    )?;
+    draw_residuals(&test_pairs, &out_dir.join(format!("{}_flagship_residuals.png", subset.code())))?;
 
     println!("wrote charts to {}", out_dir.display());
     Ok(())
@@ -280,6 +310,103 @@ fn draw_raw_vs_rolling_mean(
         .background_style(WHITE.mix(0.8))
         .border_style(BLACK)
         .draw()?;
+
+    root.present()?;
+    Ok(())
+}
+
+fn draw_predicted_vs_actual(pairs: &[(f64, f64)], rmse: f64, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let root = BitMapBackend::new(path, (700, 700)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let max_val = pairs.iter().flat_map(|&(p, t)| [p, t]).fold(0.0f64, f64::max) * 1.05;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption(
+            format!("Flagship GBM: predicted vs. actual RUL (test RMSE {:.1} cycles)", rmse),
+            ("sans-serif", 20),
+        )
+        .margin(15)
+        .x_label_area_size(35)
+        .y_label_area_size(50)
+        .build_cartesian_2d(0f64..max_val, 0f64..max_val)?;
+
+    chart
+        .configure_mesh()
+        .x_desc("true RUL (cycles)")
+        .y_desc("predicted RUL (cycles)")
+        .draw()?;
+
+    chart
+        .draw_series(LineSeries::new(
+            vec![(0.0, 0.0), (max_val, max_val)],
+            ShapeStyle::from(&BLACK.mix(0.5)).stroke_width(1),
+        ))?
+        .label("perfect prediction")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLACK.mix(0.5)));
+
+    // Colored by direction, not just plotted uniformly: late predictions
+    // (predicted > true) are the dangerous direction PHM08 scoring
+    // penalizes hardest - seeing where they cluster (here, mostly at
+    // higher true RUL, i.e. engines with more life left) is more useful
+    // than a single-color scatter.
+    let early: Vec<(f64, f64)> = pairs.iter().filter(|&&(p, a)| p < a).map(|&(p, a)| (a, p)).collect();
+    let late: Vec<(f64, f64)> = pairs.iter().filter(|&&(p, a)| p >= a).map(|&(p, a)| (a, p)).collect();
+
+    chart
+        .draw_series(early.iter().map(|&(x, y)| Circle::new((x, y), 4, BLUE.mix(0.6).filled())))?
+        .label(format!("early, safe direction ({})", early.len()))
+        .legend(|(x, y)| Circle::new((x + 10, y), 4, BLUE.mix(0.6).filled()));
+
+    chart
+        .draw_series(late.iter().map(|&(x, y)| Circle::new((x, y), 4, RED.mix(0.6).filled())))?
+        .label(format!("late, dangerous direction ({})", late.len()))
+        .legend(|(x, y)| Circle::new((x + 10, y), 4, RED.mix(0.6).filled()));
+
+    chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
+        .draw()?;
+
+    root.present()?;
+    Ok(())
+}
+
+fn draw_residuals(pairs: &[(f64, f64)], path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let root = BitMapBackend::new(path, (960, 500)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let x_max = pairs.iter().map(|&(_, actual)| actual).fold(0.0f64, f64::max) * 1.05;
+    let y_bound = pairs
+        .iter()
+        .map(|&(pred, actual)| (pred - actual).abs())
+        .fold(0.0f64, f64::max)
+        * 1.1;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Flagship GBM: prediction error vs. true RUL", ("sans-serif", 20))
+        .margin(15)
+        .x_label_area_size(35)
+        .y_label_area_size(60)
+        .build_cartesian_2d(0f64..x_max, -y_bound..y_bound)?;
+
+    chart
+        .configure_mesh()
+        .x_desc("true RUL (cycles)")
+        .y_desc("error = predicted - true (cycles)")
+        .draw()?;
+
+    chart.draw_series(LineSeries::new(
+        vec![(0.0, 0.0), (x_max, 0.0)],
+        ShapeStyle::from(&BLACK.mix(0.6)).stroke_width(1),
+    ))?;
+
+    chart.draw_series(pairs.iter().map(|&(pred, actual)| {
+        let error = pred - actual;
+        let color = if error >= 0.0 { RED.mix(0.6) } else { BLUE.mix(0.6) };
+        Circle::new((actual, error), 4, color.filled())
+    }))?;
 
     root.present()?;
     Ok(())
