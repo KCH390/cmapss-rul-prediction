@@ -10,7 +10,7 @@ industrial reliability engineering — "how much running time is left before
 this fails" — which is a regression problem, not a classification one, and
 uses this repo to explore that in a systems language instead of Python.
 
-**Status: Phase 3 of 6 — baseline models (linear regression, random forest).**
+**Status: Phase 4 of 6 — flagship model (hand-built gradient-boosted trees).**
 See [Roadmap](#roadmap).
 
 ## Dataset
@@ -188,6 +188,70 @@ Predictions are written to `data/processed/{subset}_test_predictions.csv`
 (unit, true RUL, both models' predictions, both errors) for further
 analysis.
 
+## Phase 4: flagship model — gradient-boosted trees, hand-built
+
+`core/src/tree.rs` and `core/src/boosting.rs`: a CART-style regression tree
+(variance-reduction splitting, O(n log n) per feature per node via a
+sort-then-scan search rather than a naive O(n²) rescan) and gradient
+boosting on top of it (sequential trees fit to residuals, with shrinkage).
+For squared-error loss, the negative gradient is exactly `target -
+current_prediction` — a plain residual — which is why this doesn't need a
+general autodiff framework, just repeated residual fitting.
+
+**This adds zero dependencies.** Unlike Phase 3's baselines, which needed a
+separate `models` crate specifically to keep `linfa`/`smartcore` out of
+`core`'s build graph, the flagship model needs no such isolation — it's
+pure `std`, so it lives directly in `core` as a second binary
+(`core/src/bin/flagship.rs`; Cargo auto-discovers anything under
+`src/bin/`). The tree/boosting logic has 11 unit tests covering split
+correctness, max-depth/min-samples-leaf enforcement, duplicate-value
+handling, monotonic training-error convergence, and — since this
+implementation has no randomness anywhere (no bootstrap sampling, no
+feature subsampling, unlike random forest) — exact determinism between
+identical runs.
+
+Same evaluation methodology as Phase 3 (one prediction per test engine, at
+its last recorded cycle) and the same excluded-sensor feature set, for a
+fair comparison:
+
+| Subset | Model | RMSE (cycles) | PHM08 score |
+|--------|-------|---------------|-------------|
+| FD001  | Linear regression | 20.45 | 1100.1 |
+| FD001  | Random forest      | 19.39 | 1501.2 |
+| FD001  | **Flagship GBM (from scratch)** | **18.07** | **982.8** |
+| FD003  | Linear regression | 19.94 | **1400.2** |
+| FD003  | Random forest      | 20.42 | 2031.8 |
+| FD003  | **Flagship GBM (from scratch)** | **19.31** | 1606.8 |
+
+**FD001: a clean win** — the flagship model beats both baselines on both
+metrics. **FD003: a mixed, more honest result** — flagship has the best
+RMSE (19.31), but linear regression still has the better PHM08 score
+(1400.2 vs 1606.8), the same RMSE-vs-score tension from Phase 3: a few
+large late-direction errors in the tail can outweigh a lower average error
+once the score's exponential late-penalty is applied. Reporting the FD001
+win without the FD003 caveat would be cherry-picking; both are here.
+
+Default hyperparameters (`n_trees=100, learning_rate=0.1, max_depth=3,
+min_samples_leaf=20`) are informed defaults (matching typical GBM
+conventions, e.g. scikit-learn's `GradientBoostingRegressor`), **not
+exhaustively tuned** — there's real room to improve these numbers further,
+which is an honest limitation rather than a claim that this is optimal.
+
+Run it yourself:
+
+```bash
+cargo build -p cmapss-rul-prediction --bin flagship --release
+./target/release/flagship          # FD001 by default
+./target/release/flagship fd003
+./target/release/flagship fd001 --n-trees 200 --learning-rate 0.05 --max-depth 4
+```
+
+**Use `--release`** here too, for the same reason as Phase 3's `models`.
+
+Writes `data/processed/{subset}_flagship_predictions.csv` and
+`{subset}_flagship_training_curve.csv` (training RMSE after each tree is
+added — see the Charting section for a plotted version).
+
 ## Charting
 
 Static sanity-check charts live in a separate `charts` crate — see
@@ -204,7 +268,10 @@ the 3 most-correlated sensors, one more for the sensor with the *highest
 raw variance* (kept deliberately, even though it isn't top-3 by
 correlation — high variance and high relevance turned out to be different
 things, and the chart makes that visible instead of quietly picking a
-better sensor), and the piecewise-linear RUL label shape.
+better sensor), the piecewise-linear RUL label shape, and (Phase 4) the
+flagship model's training-RMSE-vs-trees-added convergence curve — trained
+live with the same defaults as the `flagship` binary, not read from a CSV
+that could go stale.
 
 **On notebooks:** the natural instinct for exploratory charting is a Jupyter
 notebook, and there's a genuinely "rusty" way to get one — [`evcxr_jupyter`](https://github.com/evcxr/evcxr),
@@ -225,24 +292,24 @@ is the fallback - plain PNGs, zero notebook tooling, still 100% Rust.
 
 ## Dependency philosophy
 
-**The core pipeline (`core/`) has zero external dependencies**, enforced
-structurally rather than by convention: it's a separate workspace member
-from `charts/` and `models/`, so nothing charting- or ML-library-related
-can end up in its dependency tree even by accident. Parsing, RUL labeling,
-windowed features, summary statistics, evaluation metrics, and CLI argument
-handling are all hand-rolled. A CLI crate (`clap`) would normally be the
-idiomatic, unremarkable choice for argument parsing — but every CLI in this
-workspace has a small enough surface (one positional enum, a few flags)
-that `std::env::args()` covers it without pulling in a dependency for
-plumbing.
+**The core pipeline (`core/`) has zero external dependencies** — including
+the Phase 4 flagship model — enforced structurally rather than by
+convention: `charts/` and `models/` are separate workspace members
+specifically so nothing charting- or ML-library-related can end up in
+core's dependency tree even by accident. Parsing, RUL labeling, windowed
+features, summary statistics, evaluation metrics, the regression tree and
+gradient boosting implementation, and CLI argument handling are all
+hand-rolled. A CLI crate (`clap`) would normally be the idiomatic,
+unremarkable choice for argument parsing — but every CLI in this workspace
+has a small enough surface (one positional enum, a few flags) that
+`std::env::args()` covers it without pulling in a dependency for plumbing.
 
 `plotters` (in `charts/`) and `linfa`/`smartcore` (in `models/`) are the
 deliberate exceptions — the agreed hybrid approach: crates for
 well-understood, standard algorithms (linear regression, random forest,
-rendering pixels), hand-rolled code for the logic that's actually
-differentiating for this project (RUL labeling, the PHM08 scoring function,
-feature engineering, and — coming in Phase 4 — gradient-boosted trees built
-from scratch).
+rendering pixels) where using a library isn't interesting or
+differentiating, hand-rolled code for the logic that is: RUL labeling, the
+PHM08 scoring function, feature engineering, and the flagship model itself.
 
 ## Project structure
 
@@ -270,8 +337,11 @@ cmapss-rul-prediction/
 │   │   ├── features.rs             # rolling-window feature engineering (Phase 2)
 │   │   ├── design_matrix.rs        # flat feature vectors for ML libraries (Phase 3)
 │   │   ├── scoring.rs               # RMSE + PHM08 asymmetric scoring function (Phase 3)
-│   │   └── eda.rs                  # cycle-length, sensor-variance, sensor-RUL correlation
+│   │   ├── tree.rs                  # CART regression tree, hand-built (Phase 4)
+│   │   ├── boosting.rs               # gradient boosting on top of tree.rs (Phase 4)
+│   │   ├── eda.rs                  # cycle-length, sensor-variance, sensor-RUL correlation
 │   │   └── error.rs                 # hand-rolled error type
+│   │   └── bin/flagship.rs           # Phase 4 flagship model CLI (auto-discovered by Cargo)
 │   └── tests/data_integrity.rs   # integration tests against the real files
 ├── charts/                       # sanity-check chart generation (plotters lives only here)
 │   ├── Cargo.toml
@@ -304,6 +374,11 @@ cargo run -p charts
 # Baseline models (explicit -p, same reason). Use --release - see Phase 3 section.
 cargo run -p models --release
 cargo run -p models --release -- fd003
+
+# Flagship model (in core, zero new dependencies). Also use --release.
+cargo build -p cmapss-rul-prediction --bin flagship --release
+./target/release/flagship
+./target/release/flagship fd003
 ```
 
 ## Testing
@@ -313,19 +388,21 @@ cargo run -p models --release -- fd003
 cargo test
 ```
 
-36 tests (28 unit, 8 integration), all running against the real checked-in
+47 tests (39 unit, 8 integration), all running against the real checked-in
 dataset (no synthetic fixtures for the integration tests) — unit-count
 sanity checks against the readme (including the corrected FD004 numbers),
 RUL monotonicity and cap enforcement, test-set RUL reconstruction against
 ground truth, full parse coverage across all 8 train/test files, window-size
-safety margin and structural leakage checks, and (new in Phase 3) scoring
-function correctness and feature-vector construction.
+safety margin and structural leakage checks, scoring function correctness,
+feature-vector construction, and (new in Phase 4) regression tree split
+correctness, constraint enforcement, and gradient boosting convergence/
+determinism.
 
 ## Roadmap
 
 1. ~~Scaffold, data loading, RUL labeling, EDA~~ (Phase 1)
 2. ~~Feature engineering: rolling-window statistics per sensor per engine, run-aware to prevent cross-engine leakage~~ (Phase 2)
-3. ~~Baseline models (`linfa` linear regression, `smartcore` random forest), evaluated on RMSE and NASA's official asymmetric scoring function~~ (this phase)
-4. Flagship model: gradient-boosted regression trees, hand-built from scratch
+3. ~~Baseline models (`linfa` linear regression, `smartcore` random forest), evaluated on RMSE and NASA's official asymmetric scoring function~~ (Phase 3)
+4. ~~Flagship model: gradient-boosted regression trees, hand-built from scratch~~ (this phase)
 5. Generalization to FD002/FD004: operating-condition clustering + per-regime normalization, documented as an explicit extension (see EDA findings above)
 6. *(stretch)* Sequence modeling (LSTM via `candle`/`burn`), the literature-standard approach for this dataset

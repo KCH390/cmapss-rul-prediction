@@ -12,12 +12,15 @@ use std::path::Path;
 
 use plotters::prelude::*;
 
+use cmapss_rul::boosting::{GbmParams, GradientBoostedTrees};
 use cmapss_rul::dataset::Subset;
-use cmapss_rul::eda::sensor_rul_correlation;
+use cmapss_rul::design_matrix::to_feature_vector;
+use cmapss_rul::eda::{near_constant_sensors, sensor_rul_correlation, sensor_stats};
 use cmapss_rul::features::{compute_windowed_features, WindowedFeatures, DEFAULT_WINDOW};
 use cmapss_rul::loader::{group_by_unit, load_records, EngineRun};
 use cmapss_rul::parser::NUM_SENSORS;
 use cmapss_rul::rul::{label_train_rul, DEFAULT_RUL_CAP};
+use cmapss_rul::tree::TreeParams;
 
 /// Sensor kept from the original Phase 2 chart on purpose: it has the
 /// *highest raw variance* in FD001's training set, which made it look like
@@ -125,7 +128,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &out_dir.join(format!("{}_unit{}_rul_shape.png", subset.code(), longest_run.unit)),
     )?;
 
+    // --- Phase 4: flagship model training curve ---
+    // Recomputed live rather than read from a CSV the flagship binary may
+    // or may not have been run recently - this stays correct even if
+    // someone runs `cargo run -p charts` without ever running `flagship`.
+    println!("training the flagship GBM to chart its convergence (same defaults as `flagship`)...");
+    let excluded = near_constant_sensors(&sensor_stats(&train_runs));
+    let mut x_train: Vec<Vec<f64>> = Vec::new();
+    let mut y_train: Vec<f64> = Vec::new();
+    for (run, run_labels) in train_runs.iter().zip(labels.iter()) {
+        for wf in compute_windowed_features(run, run_labels, DEFAULT_WINDOW) {
+            x_train.push(to_feature_vector(&wf, &excluded));
+            y_train.push(wf.rul as f64);
+        }
+    }
+    let gbm_params = GbmParams {
+        n_trees: 100,
+        learning_rate: 0.1,
+        tree: TreeParams { max_depth: 3, min_samples_leaf: 20 },
+    };
+    let model = GradientBoostedTrees::fit(&x_train, &y_train, &gbm_params);
+    draw_training_curve(&model.training_rmse, &out_dir.join(format!("{}_flagship_training_curve.png", subset.code())))?;
+
     println!("wrote charts to {}", out_dir.display());
+    Ok(())
+}
+
+fn draw_training_curve(training_rmse: &[f64], path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let root = BitMapBackend::new(path, (960, 500)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let points: Vec<(f64, f64)> = training_rmse
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| ((i + 1) as f64, r))
+        .collect();
+    let y_max = training_rmse.iter().cloned().fold(f64::NEG_INFINITY, f64::max) * 1.05;
+    let x_max = training_rmse.len() as f64;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Flagship GBM: training RMSE vs. number of trees", ("sans-serif", 22))
+        .margin(15)
+        .x_label_area_size(35)
+        .y_label_area_size(50)
+        .build_cartesian_2d(1f64..x_max, 0f64..y_max)?;
+
+    chart
+        .configure_mesh()
+        .x_desc("trees added")
+        .y_desc("training RMSE (cycles)")
+        .draw()?;
+
+    chart.draw_series(LineSeries::new(points, ShapeStyle::from(&RED).stroke_width(2)))?;
+
+    root.present()?;
     Ok(())
 }
 
