@@ -3,15 +3,20 @@
 Remaining Useful Life (RUL) prediction for NASA's C-MAPSS turbofan engine
 degradation dataset, written in Rust.
 
-This project is a companion to [`secom-fault-detection`](#) and
-[`tep-fault-diagnosis`](#): those two answer "is something wrong *right
-now*" (fault detection/diagnosis). This one answers the other half of
-industrial reliability engineering — "how much running time is left before
-this fails" — which is a regression problem, not a classification one, and
-uses this repo to explore that in a systems language instead of Python.
+This project is a companion to `secom-fault-detection` and
+`tennessee-eastman-fdd`: those two answer "is something wrong right now"
+(fault detection/diagnosis). This one answers the other half of industrial
+reliability engineering — "how much running time is left before this
+fails" — a regression problem rather than a classification one.
 
-**Status: Phase 5 of 6 — generalization to FD002/FD004 via operating-regime
-normalization.** See [Roadmap](#roadmap).
+## Status
+
+- Data loading, parsing, and RUL labeling
+- Rolling-window feature engineering
+- Baseline models (linear regression, random forest)
+- Flagship model: gradient-boosted trees, built from scratch
+- Regime normalization and generalization to the multi-condition subsets (FD002/FD004)
+- LSTM sequence model — implemented, not yet validated end-to-end (see [LSTM sequence model](#lstm-sequence-model-experimental))
 
 ## Dataset
 
@@ -33,59 +38,70 @@ RUL file for the test split:
 | FD003  | 1 (sea level)         | 2 (HPC, Fan)         | 100 | 100 |
 | FD004  | 6                     | 2 (HPC, Fan)         | 249\* | 248\* |
 
-\* **The official readme's FD004 counts are transposed relative to the real
-files.** The readme states 248 train / 249 test; the actual files contain
-249 train units (IDs 1–249, no gaps) and 248 test units (IDs 1–248), and
-`RUL_FD004.txt` has exactly 248 lines, matching the test set. Totals agree
-either way (497), so this reads as a documentation swap rather than missing
-data — verified directly against the raw files in `tests/data_integrity.rs`,
-not assumed from the readme. Every other subset's counts match the readme
-exactly.
+\* NASA's own readme states FD004 has 248 training / 249 test trajectories.
+The actual files contain 249 training units (IDs 1–249, no gaps) and 248
+test units (IDs 1–248), and `RUL_FD004.txt` has exactly 248 lines, matching
+the test set. The totals agree either way (497), so this looks like a
+transcription swap in the documentation rather than missing data. Every
+other subset's counts match the readme exactly. This is pinned by a test in
+`core/tests/data_integrity.rs` and reflected in `dataset.rs`'s metadata.
 
 Each row is one engine-cycle: unit number, cycle number, 3 operational
-settings, 21 sensor measurements (26 whitespace-delimited columns total,
-confirmed by counting fields on real rows).
+settings, 21 sensor measurements (26 whitespace-delimited columns total).
 
-### Why the raw data is checked into this repo
+### Data provenance
 
-Unlike `tep-fault-diagnosis` (whose dataset is ~1.3GB and requires a manual
-download), the full C-MAPSS dataset — all four subsets, train, test, and RUL
-files — is 43MB, small enough to commit directly. That means `git clone` +
-`cargo run` reproduces everything with no separate download step.
-
-The files here were pulled from the [mapr-demos/predictive-maintenance](https://github.com/mapr-demos/predictive-maintenance)
-mirror of the original NASA distribution (verified byte-identical in
-structure to the official readme's documented format). The original PDF
-(`Damage Propagation Modeling.pdf`) is not included — see the citation above
-instead.
+The full dataset — all four subsets, train, test, and RUL files — is 43MB
+and is checked directly into `data/raw/CMAPSSData/`, pulled from the
+[mapr-demos/predictive-maintenance](https://github.com/mapr-demos/predictive-maintenance)
+mirror of the original NASA distribution. `git clone` + `cargo run`
+reproduces everything with no separate download step. The original PDF
+(`Damage Propagation Modeling.pdf`) is not included — see the citation
+above instead.
 
 ## RUL labeling
 
 Training trajectories run all the way to failure, so RUL at each cycle is
-just "cycles remaining until the last recorded cycle." Test trajectories are
+"cycles remaining until the last recorded cycle." Test trajectories are
 truncated before failure; `RUL_FDxxx.txt` gives the true RUL at each test
-unit's *last* recorded cycle, and earlier cycles are reconstructed by adding
+unit's last recorded cycle, and earlier cycles are reconstructed by adding
 back cycles-until-that-point.
 
-Raw "cycles until failure" isn't a sensible regression target very early in
-an engine's life — there's no meaningful degradation trend yet. Following
-the piecewise-linear convention introduced in:
+Raw "cycles until failure" isn't a sensible regression target early in an
+engine's life, since there's no meaningful degradation trend yet. Following
+the piecewise-linear convention introduced in Heimes (2008), "Recurrent
+Neural Networks for Remaining Useful Life Estimation" (PHM08), RUL is
+flattened at a cap (default 125 cycles, the most commonly cited value in
+follow-on work) until an engine is actually approaching failure, then
+decays linearly. The cap is a CLI flag (`--rul-cap`), not hard-coded, since
+different papers use different values.
 
-> F.O. Heimes (2008). "Recurrent Neural Networks for Remaining Useful Life
-> Estimation", PHM08.
+## Feature engineering
 
-RUL is flattened at a cap (default **125** cycles, the most commonly cited
-value in follow-on work) until an engine is actually approaching failure,
-then decays linearly. The cap is a CLI flag (`--rul-cap`), not hard-coded,
-since different papers use different values.
+For each engine, sensor, and cycle with a full trailing window available,
+three rolling statistics are computed: mean, sample standard deviation, and
+least-squares slope against cycle index. Windowing is run-aware by
+construction — it operates on a single engine's already-grouped
+trajectory, so there's no code path that could pull a window from a
+different engine's history (`windowed_features_never_mix_two_engines`
+pins this structurally).
 
-## Phase 1 EDA findings
+Window size (`DEFAULT_WINDOW = 10`) is constrained by the shortest test run
+in the dataset rather than chosen for smoothness: FD004's shortest test run
+is 19 cycles, and a larger window would leave some test engines with zero
+windowed rows — including at their last recorded cycle, which is exactly
+the point the scoring function evaluates. This is enforced by an
+integration test against the real data rather than just assumed. Cycles
+before an engine's first full window are dropped entirely (not computed
+from a partial window), since a standard deviation or slope from one or
+two points isn't meaningful.
 
-Running the full pipeline over all four subsets surfaces one genuinely
-useful pattern: **near-constant sensors only show up in the single-condition
-subsets.**
+## Exploratory findings
 
-| Subset | Near-constant sensors (std < 1e-6) |
+Near-constant sensors (std < 1e-6) appear only in the single-condition
+subsets:
+
+| Subset | Near-constant sensors |
 |--------|-------------------------------------|
 | FD001  | 1, 5, 10, 16, 18, 19 |
 | FD002  | none |
@@ -93,62 +109,51 @@ subsets.**
 | FD004  | none |
 
 This isn't a coincidence: FD002/FD004 sweep 6 operating conditions, so
-sensors that read essentially flat at a single fixed condition (FD001/FD003)
-actually vary once the operating regime itself changes. This directly
-foreshadows why **Phase 5** (generalizing to FD002/FD004) can't just reuse
-Phase 1–4's feature set unchanged — it needs per-regime normalization first,
-or these sensors look informative for the wrong reason.
+sensors that read essentially flat at a single fixed condition actually
+vary once the operating regime itself changes. This is why the
+multi-condition subsets need per-regime normalization (see below) before
+the same feature set is meaningful — otherwise these sensors look
+informative for the wrong reason.
 
-Full report: `cargo run` (see below).
+Full report: `cargo run`.
 
-## Phase 2: rolling-window features
+## Evaluation methodology
 
-For each engine, each sensor, and each cycle with a full trailing window
-available, three features are computed over that window: mean, sample std
-dev, and least-squares slope against cycle index. This is run-aware by
-construction, not by a leakage check bolted on afterward — the windowing
-function operates on a single engine's already-grouped `EngineRun`, so
-there's no code path that could pull a window from a different engine's
-history (see `windowed_features_never_mix_two_engines` in the integration
-tests, which pins this structurally rather than just trusting it).
+Training pools every windowed row of every training engine (ordinary data
+augmentation — tens of thousands of rows per subset). Evaluation uses
+exactly one row per test engine: the window ending at that engine's last
+recorded cycle. This matches the official PHM08 competition protocol,
+which scores one RUL prediction per engine, made at the point its data was
+truncated — scoring every windowed row of a test trajectory would inflate
+apparent performance, since consecutive windows from the same engine are
+highly correlated.
 
-**Window size (`DEFAULT_WINDOW = 10`) is constrained by the shortest test
-run in the dataset, not chosen for smoothness.** FD004's shortest test run
-is 19 cycles (see the EDA table above). If the window were too large
-relative to that, some test engines would produce *zero* windowed feature
-rows — including at their last recorded cycle, which is exactly the point
-the official scoring function evaluates. `default_window_leaves_every_test_unit_with_at_least_one_windowed_row`
-checks this directly against the real data rather than assuming a chosen
-window is safe. Cycles before an engine's first full window are dropped
-entirely (not computed from a partial window) since a std dev or slope
-from 1-2 points isn't meaningful.
+Two metrics are reported throughout:
 
-## Phase 3: baseline models
+- **RMSE** — symmetric; over- and under-predicting by the same amount cost
+  the same.
+- **PHM08 score** — NASA's official asymmetric scoring function. For each
+  prediction, `d = predicted − true`; early predictions (`d < 0`, calling
+  for maintenance sooner than necessary) are penalized as `exp(-d/13) - 1`,
+  late predictions (`d ≥ 0`, running an engine past its actual failure
+  point) as the steeper `exp(d/10) - 1`. Lower is better; 0 is perfect.
 
-Two standard regressors — linear regression (`linfa`) and random forest
-(`smartcore`) — evaluated on FD001 and FD003 (the two single-condition
-subsets; FD002/FD004 wait for Phase 5's regime normalization, since running
-them now would just be measuring how much the untreated multi-condition
-noise hurts, not how good the model is). No hyperparameter tuning yet —
-these are floor numbers, meant to be beaten by Phase 4's hand-built model.
+The two metrics can disagree (see Results below), which is why both are
+always reported together rather than either alone.
 
-**Evaluation methodology, which is easy to get wrong:** training pools every
-windowed row of every training engine (normal data augmentation for this
-task — ~20-24k rows). Evaluation uses exactly **one row per test engine**:
-the window ending at that engine's last recorded cycle, since that's what
-the official PHM08 protocol actually scores — one RUL prediction per
-engine, made at the point its data was truncated. Scoring every windowed
-row of a test trajectory would inflate apparent performance, since
-consecutive windows from the same engine are highly correlated.
+Feature selection excludes whichever sensors a subset's own training data
+shows to be near-constant (per the table above), leaving 60–64 features
+per row (raw value, rolling mean, rolling std, rolling slope × the
+remaining sensors). Operational settings are excluded from the feature
+vector for every subset — see `core/src/design_matrix.rs`.
 
-**Feature selection** excludes whichever sensors that subset's own EDA
-flagged as near-constant back in Phase 1/2 — 6 sensors for FD001, 5 for
-FD003 (see the EDA table above) — leaving 60-64 features (raw/mean/std/slope
-× the remaining sensors). This is Phase 1's findings directly feeding Phase
-3's modeling, not two disconnected steps. Operational settings are excluded
-for every subset; see `core/src/design_matrix.rs` for why.
+## Models
 
-Results (no tuning, `--window 10`, `--rul-cap 125`):
+### Baseline models
+
+Linear regression (`linfa`) and random forest (`smartcore`), evaluated on
+FD001 and FD003 (FD002/FD004 need regime normalization first — see below).
+No hyperparameter tuning.
 
 | Subset | Model | RMSE (cycles) | PHM08 score | Late / early |
 |--------|-------|---------------|-------------|--------------|
@@ -157,62 +162,48 @@ Results (no tuning, `--window 10`, `--rul-cap 125`):
 | FD003  | Linear regression | 19.94 | **1400.2** | 64 / 36 |
 | FD003  | Random forest      | 20.42 | 2031.8 | 60 / 40 |
 
-**A real, worth-explaining disagreement**: on FD001, random forest has the
-*better* RMSE (19.39 vs 20.45) but the *worse* PHM08 score (1501.2 vs
-1100.1). Its worst 3 test-set errors are all late (+60.5, +55.7, +52.7 —
-predicting more remaining life than the engine actually had), while linear
-regression's worst 3 split between directions. Since PHM08 scoring
-penalizes late errors exponentially (divisor 10) more steeply than early
-ones (divisor 13), a handful of large late outliers can dominate the sum
-even when the model's *average* error is smaller — exactly the score's
-known outlier sensitivity discussed in the literature, and why RMSE gets
-reported alongside it rather than instead of it. This isn't a bug to fix;
-it's the reason both metrics matter, and it's a fair preview of what
-permutation importance / error analysis in a later phase should dig into
-for random forest specifically.
-
-Run it yourself:
+RMSE and the PHM08 score disagree here: on FD001, random forest has the
+better RMSE (19.39 vs 20.45) but the worse score (1501.2 vs 1100.1). Its
+three worst test-set errors are all in the late direction (+60.5, +55.7,
++52.7), while linear regression's worst errors split between directions.
+Because the score penalizes late errors exponentially more steeply than
+early ones, a handful of large late outliers can dominate the sum even when
+the model's average error is smaller — a known sensitivity of this scoring
+function, and the reason RMSE is reported alongside it rather than instead
+of it.
 
 ```bash
 cargo run -p models --release           # FD001 by default
 cargo run -p models --release -- fd003
 ```
 
-**Use `--release`.** A debug build spent 2.5+ minutes at 100% CPU on this
-(random forest training on ~20k rows × 60 features is real numeric work);
-release finishes in a couple of seconds. This isn't a Rust-specific gotcha,
-but it's an easy one to hit coming from Python, where `import sklearn`
-gives you optimized code regardless of how your own script is invoked.
+Debug builds are noticeably slower for this kind of numeric workload
+(fitting a random forest on tens of thousands of rows is real work) — use
+`--release`.
 
-Predictions are written to `data/processed/{subset}_test_predictions.csv`
-(unit, true RUL, both models' predictions, both errors) for further
-analysis.
+Predictions are written to `data/processed/{subset}_test_predictions.csv`.
 
-## Phase 4: flagship model — gradient-boosted trees, hand-built
+### Flagship model: gradient-boosted trees
 
-`core/src/tree.rs` and `core/src/boosting.rs`: a CART-style regression tree
-(variance-reduction splitting, O(n log n) per feature per node via a
-sort-then-scan search rather than a naive O(n²) rescan) and gradient
-boosting on top of it (sequential trees fit to residuals, with shrinkage).
-For squared-error loss, the negative gradient is exactly `target -
-current_prediction` — a plain residual — which is why this doesn't need a
-general autodiff framework, just repeated residual fitting.
+A CART-style regression tree (`core/src/tree.rs`) and gradient boosting on
+top of it (`core/src/boosting.rs`), built with no dependencies beyond
+`std`. Splitting uses variance-reduction via a sort-then-scan search
+(O(n log n) per feature per node): candidate splits are found by sorting
+flat `(value, target, index)` tuples directly rather than sorting indices
+through a comparator that reaches back into the feature matrix — the
+latter is markedly slower at this scale, since it defeats cache locality
+across every comparison in the sort. Because the implementation uses no
+bootstrap sampling or feature subsampling, fitting is exactly
+deterministic: identical input always produces identical output.
 
-**This adds zero dependencies.** Unlike Phase 3's baselines, which needed a
-separate `models` crate specifically to keep `linfa`/`smartcore` out of
-`core`'s build graph, the flagship model needs no such isolation — it's
-pure `std`, so it lives directly in `core` as a second binary
-(`core/src/bin/flagship.rs`; Cargo auto-discovers anything under
-`src/bin/`). The tree/boosting logic has 11 unit tests covering split
-correctness, max-depth/min-samples-leaf enforcement, duplicate-value
-handling, monotonic training-error convergence, and — since this
-implementation has no randomness anywhere (no bootstrap sampling, no
-feature subsampling, unlike random forest) — exact determinism between
-identical runs.
+This needs no dependencies beyond `std`, so it lives directly in `core` as
+a second binary (`core/src/bin/flagship.rs`, auto-discovered by Cargo)
+rather than a separate crate — unlike the baseline models above, which
+needed `models` specifically to keep `linfa`/`smartcore` isolated from
+`core`'s dependency graph.
 
-Same evaluation methodology as Phase 3 (one prediction per test engine, at
-its last recorded cycle) and the same excluded-sensor feature set, for a
-fair comparison:
+Same evaluation methodology and feature set as the baselines, for a direct
+comparison:
 
 | Subset | Model | RMSE (cycles) | PHM08 score |
 |--------|-------|---------------|-------------|
@@ -223,21 +214,14 @@ fair comparison:
 | FD003  | Random forest      | 20.42 | 2031.8 |
 | FD003  | **Flagship GBM (from scratch)** | **19.31** | 1606.8 |
 
-**FD001: a clean win** — the flagship model beats both baselines on both
-metrics. **FD003: a mixed, more honest result** — flagship has the best
-RMSE (19.31), but linear regression still has the better PHM08 score
-(1400.2 vs 1606.8), the same RMSE-vs-score tension from Phase 3: a few
-large late-direction errors in the tail can outweigh a lower average error
-once the score's exponential late-penalty is applied. Reporting the FD001
-win without the FD003 caveat would be cherry-picking; both are here.
+FD001 is a clean sweep: the flagship model beats both baselines on both
+metrics. FD003 is more mixed — flagship has the best RMSE, but linear
+regression still edges it out on the PHM08 score, the same RMSE/score
+tension seen with the baselines.
 
 Default hyperparameters (`n_trees=100, learning_rate=0.1, max_depth=3,
-min_samples_leaf=20`) are informed defaults (matching typical GBM
-conventions, e.g. scikit-learn's `GradientBoostingRegressor`), **not
-exhaustively tuned** — there's real room to improve these numbers further,
-which is an honest limitation rather than a claim that this is optimal.
-
-Run it yourself:
+min_samples_leaf=20`) follow typical GBM conventions (e.g. scikit-learn's
+`GradientBoostingRegressor`) and are not exhaustively tuned.
 
 ```bash
 cargo build -p cmapss-rul-prediction --bin flagship --release
@@ -246,102 +230,68 @@ cargo build -p cmapss-rul-prediction --bin flagship --release
 ./target/release/flagship fd001 --n-trees 200 --learning-rate 0.05 --max-depth 4
 ```
 
-**Use `--release`** here too, for the same reason as Phase 3's `models`.
-
 Writes `data/processed/{subset}_flagship_predictions.csv` and
 `{subset}_flagship_training_curve.csv` (training RMSE after each tree is
-added — see the Charting section for a plotted version).
+added — see [Charting](#charting) for a plotted version).
 
-## Phase 5: generalizing to FD002/FD004
+### Regime normalization (FD002 / FD004)
 
-Phase 1's EDA foreshadowed this: FD002/FD004 sweep 6 operating conditions,
-so a sensor that reads flat within one fixed condition (FD001/FD003)
-actually swings across conditions here — not from degradation, but from
-which flight regime the engine happens to be in. This phase adds:
+FD002/FD004 sweep 6 operating conditions, so a sensor that reads flat
+within one fixed condition (FD001/FD003) actually swings across
+conditions here — not from degradation, but from which flight regime the
+engine happens to be in at that cycle.
 
-- **`core/src/kmeans.rs`** — k-means from scratch, with k-means++
-  initialization for reliable convergence and a hand-rolled seeded PRNG
-  (SplitMix64) so fitting is exactly reproducible, matching every other
-  deterministic guarantee this project makes.
-- **`core/src/regime.rs`** — fits k=6 regimes on the 3 operational settings
-  (k=1 for FD001/FD003, degenerating to harmless global standardization),
-  then z-scores every sensor against its assigned regime's **training-set**
-  mean/std. Regime stats are fit on training data only and reused unchanged
-  for test data — fitting on test data too would leak test-set information
-  into the transformation test predictions are later evaluated against.
-- Both add **zero new dependencies** — clustering is genuinely
-  differentiating logic (not plumbing), consistent with the project's hybrid
-  approach, and lives in `core` alongside the tree/boosting code.
+K-means (`core/src/kmeans.rs`, k-means++ initialization, a seeded PRNG for
+reproducible fitting — zero dependencies, consistent with the rest of
+`core`) clusters the 3 operational settings into `k` regimes: `k=6` for
+FD002/FD004, `k=1` for FD001/FD003 (a harmless global standardization).
+Each sensor is then z-scored against its own regime's training-set mean
+and standard deviation (`core/src/regime.rs`); regime statistics are fit
+on training data only and reused unchanged for test data, since fitting on
+test data too would leak information into the transformation test
+predictions are later evaluated against.
 
-**Empirical validation, not just an assumption**: fitting k=6 on real FD002
-training data finds six cleanly separated regimes with clean round centroid
-values —
+Fitting `k=6` on FD002's real training data finds six cleanly separated
+regimes with clean, round centroid values and reasonably balanced sizes:
 
 ```
 regime: centroid (op_setting_1, op_setting_2, op_setting_3)   count
-0.0015, 0.0005, 100.00   8044
-10.0030, 0.2505, 100.00   8096
-20.0030, 0.7005, 100.00   8122
-25.0030, 0.6205,  60.00   8002
-35.0030, 0.8405, 100.00   8037
-42.0030, 0.8405, 100.00  13458
+ 0.0015,  0.0005, 100.00   8044
+10.0030,  0.2505, 100.00   8096
+20.0030,  0.7005, 100.00   8122
+25.0030,  0.6205,  60.00   8002
+35.0030,  0.8405, 100.00   8037
+42.0030,  0.8405, 100.00  13458
 ```
 
-— reasonably balanced (8000-8100 cycles each, one larger cluster at 13458,
-plausibly a more commonly-visited flight phase like cruise). This is
-pinned as a permanent integration test
-(`regime_clustering_finds_six_well_separated_balanced_conditions...`), not
-just a one-off check.
+(the larger cluster is plausibly a more commonly-visited flight phase such
+as cruise). This is pinned by an integration test against the real data,
+not just assumed.
 
-### A real bug caught along the way
+**Note on feature selection with normalization enabled**: near-constant
+sensor exclusion must be computed from raw data, before normalization.
+Z-scoring always produces roughly unit variance from whatever it's given,
+so a sensor whose raw standard deviation sits just above the "treat as
+zero" cutoff would be normalized into a full-variance column and stop
+being excluded, even though it remains physically uninformative. Both
+`models` and `flagship` compute the exclusion list before normalizing, for
+this reason.
 
-The near-constant-sensor exclusion list (Phase 3's feature selection) was
-initially computed *after* normalization — but z-scoring always produces
-~unit variance from whatever it's given, so a sensor whose raw std sat just
-above the "treat as exactly zero" cutoff would get normalized into a
-full-variance column and silently stop being excluded, even though it's
-still physically uninformative. Fixed by computing the exclusion list from
-raw data, before normalization, in both `models` and `flagship`.
+**Note on the transform's invariance**: with `k=1` (FD001/FD003), regime
+normalization is pure global z-scoring — a per-feature affine transform
+that shouldn't change predictions from either OLS or a tree model in exact
+arithmetic. In practice, linear regression is exactly invariant (identical
+RMSE to the displayed precision), but tree-based models — including the
+flagship model, which has no randomness anywhere — show small differences
+(flagship RMSE on FD001: 18.07 vs 17.94). This isn't a bug: z-scoring
+introduces new floating-point rounding at every value, and split search
+makes discrete branching decisions, so a candidate split that's an exact
+tie in real-number arithmetic can resolve to a different (still valid,
+comparably good) split once rounding breaks the tie differently. Smooth
+computations like OLS's matrix solve don't have this sensitivity; discrete
+ones like tree splitting do.
 
-### A real performance problem, also caught along the way
-
-Fitting the flagship model on FD001 (Phase 4's dataset) took **71 seconds**
-for 100 trees — genuinely too slow, not just inconvenient for a sandboxed
-tool call. The cause: `find_best_split` sorted sample indices through a
-comparator that reached back into the feature matrix via double indirection
-(`rows[a][feature]`) on every comparison, which defeats CPU cache locality
-across an O(n log n) sort repeated at every node of every tree. Rewriting
-it to sort flat `(value, target, index)` tuples directly — removing the
-indirection — gave a **4.9x speedup** (71s → 14.4s) with bit-identical
-output, confirmed by comparing predictions before and after.
-
-### Verifying the transform itself is correct
-
-With k=1 (FD001/FD003), regime normalization is pure global z-scoring — a
-per-feature affine transform that shouldn't change predictions from either
-OLS or a tree-based model, in exact arithmetic. Testing this directly on
-FD001:
-
-- **Linear regression: exactly invariant** (RMSE 20.45 either way,
-  identical to the displayed precision) — confirms OLS's textbook
-  scale-invariance.
-- **Tree-based models (both smartcore's random forest and our own
-  from-scratch, zero-randomness flagship GBM): small differences**
-  (flagship: RMSE 18.07 → 17.94). This isn't a bug and isn't randomness —
-  our GBM has none. Z-scoring introduces new floating-point rounding at
-  every value, and split search makes *discrete* branching decisions: a
-  candidate split that's an exact tie in real-number arithmetic can resolve
-  to a different (still valid, comparably good) split once floating-point
-  rounding breaks the tie differently. Smooth computations like OLS's
-  matrix solve don't have this sensitivity; discrete ones like tree
-  splitting do. Confirmed by testing our own deterministic implementation,
-  which ruled out randomness as the explanation.
-
-### Results: real, and honestly mixed
-
-Same evaluation methodology as Phase 3/4 throughout (one prediction per
-test engine, at its last recorded cycle). `--normalize` fits k=6 regimes
-and z-scores accordingly:
+Results, `--normalize` vs raw (same evaluation methodology throughout):
 
 | Subset | Model | RMSE (raw) | Score (raw) | RMSE (normalized) | Score (normalized) |
 |--------|-------|-----------:|-------------:|-------------------:|---------------------:|
@@ -352,98 +302,104 @@ and z-scores accordingly:
 | FD004  | Random forest          | 20.29 | 3160.7 | **19.79** | 3369.2 |
 | FD004  | Flagship GBM           | 20.32 | 2628.9 | **18.95** | 3212.8 |
 
-**FD002 is a clean win** — normalization improves every model on every
-metric, most dramatically random forest's score (3290.0 → 1836.1, nearly
-halved).
+FD002 is a clean win: normalization improves every model on every metric,
+most notably random forest's score (3290.0 → 1836.1, nearly halved).
 
-**FD004 is genuinely harder and the story is mixed, not swept under the
-rug**: RMSE improves for both tree-based models, but the PHM08 score gets
-*worse* for both (more/larger late-direction errors even as the average
-error drops — the same RMSE-vs-score tension from Phase 3/4, now showing up
-here too). And **linear regression fails to fit at all** on normalized
-FD004 — `linfa` returns a `NonInvertible` error, meaning the design matrix
-is genuinely singular. FD004 combines 6 conditions *and* 2 fault modes (the
-most complex of the four subsets), and per-regime z-scoring evidently
-introduces near-perfect collinearity between some features under that
-combination. `models` was made resilient to this (linear regression's
-failure is reported and skipped rather than crashing the whole run, so
-random forest's results are never lost to a sibling model's failure) rather
-than papering over it with regularization or dropping the comparison.
-
-Run it yourself:
+FD004 is genuinely harder and the result is mixed: RMSE improves for both
+tree-based models, but the PHM08 score gets worse for both (more/larger
+late-direction errors even as the average error drops — the same
+RMSE/score tension seen elsewhere). Linear regression fails to fit at all
+on normalized FD004: `linfa` returns a `NonInvertible` error, meaning the
+design matrix is genuinely singular. FD004 combines 6 operating conditions
+and 2 fault modes — the most complex of the four subsets — and per-regime
+z-scoring appears to introduce near-perfect collinearity between some
+features under that combination. `models` handles this gracefully: a
+failed linear regression fit is reported and skipped rather than aborting
+the whole run, so random forest's results aren't lost to a sibling model's
+failure.
 
 ```bash
 cargo run -p models --release -- fd002 --normalize
-cargo build -p cmapss-rul-prediction --bin flagship --release
 ./target/release/flagship fd004 --normalize
+```
+
+### LSTM sequence model (experimental)
+
+`core/src/sequence.rs` extracts raw, non-aggregated sliding-window
+sequences — the `(window_size × features)` matrix an LSTM consumes,
+rather than the aggregated rolling statistics the tree/linear models use.
+This part follows the same standard as the rest of `core`: zero
+dependencies, unit tested, windowing rules kept consistent with
+`features.rs` (same run-aware guarantee, same last-cycle evaluation
+convention).
+
+The model itself (`sequence/src/main.rs`, using `candle`) lives in its own
+workspace member — the same isolation pattern as `charts` and `models`,
+keeping the deep-learning dependency stack out of `core`. It reuses the
+regime-normalization machinery above for input scaling: gradient-based
+training needs properly scaled inputs in a way tree models don't, and
+`k=1` for FD001/FD003 provides exactly that (plain global z-scoring),
+while FD002/FD004 get the regime-normalization benefit for free. The
+training loop does not currently shuffle minibatches between epochs — a
+simplification worth revisiting.
+
+**This component has not yet been run end-to-end, and no results are
+reported for it here.** Treat it as a first implementation rather than a
+validated model.
+
+```bash
+cargo build -p sequence --release
+./target/release/sequence fd001
 ```
 
 ## Charting
 
-Static sanity-check charts live in a separate `charts` crate — see
-[Project structure](#project-structure) for why it's isolated. Generate
-them with:
+Static charts are generated by a separate `charts` crate, isolated from
+`core` the same way `models` is:
 
 ```bash
 cargo run -p charts
 ```
 
 This writes several PNGs to `reports/figures/` for FD001: a bar chart of
-each sensor's Pearson correlation with RUL, raw-vs-rolling-mean charts for
-the 3 most-correlated sensors, one more for the sensor with the *highest
-raw variance* (kept deliberately, even though it isn't top-3 by
-correlation — high variance and high relevance turned out to be different
-things, and the chart makes that visible instead of quietly picking a
-better sensor), the piecewise-linear RUL label shape, and (Phase 4) the
-flagship model's training-RMSE-vs-trees-added convergence curve — trained
-live with the same defaults as the `flagship` binary, not read from a CSV
-that could go stale.
-
-**On notebooks:** the natural instinct for exploratory charting is a Jupyter
-notebook, and there's a genuinely "rusty" way to get one — [`evcxr_jupyter`](https://github.com/evcxr/evcxr),
-a real Jupyter kernel that runs actual Rust cells (not a Python wrapper
-around Rust output). It would let this project have a proper `.ipynb`
-walkthrough, calling directly into this crate's library and rendering
-charts inline via `plotters` and `evcxr_display()`, the same way the
-`secom-fault-detection` notebook narrates that pipeline in Python.
-
-I couldn't verify it hands-on here — both `evcxr_jupyter` and `plotters`'
-default text-rendering feature (`font-kit`) need a newer Rust edition than
-this sandbox's toolchain has (this is exactly the same wall `clap` hit in
-Phase 1). That's a sandbox limitation, not a verdict on the tool: it's
-actively maintained and widely used. Worth trying locally; if Jupyter/Python
-as the notebook *shell* (no Python code, just the UI) doesn't feel worth it,
-or Windows setup is more friction than it's worth, the `charts` crate above
-is the fallback - plain PNGs, zero notebook tooling, still 100% Rust.
+each sensor's Pearson correlation with RUL; raw-vs-rolling-mean charts for
+the 3 most-correlated sensors, plus one for the sensor with the highest
+raw variance (kept deliberately as a contrast — high variance and high
+relevance turned out to be different things); the piecewise-linear RUL
+label shape; the flagship model's training-RMSE-vs-trees-added convergence
+curve; and two prediction-effectiveness charts evaluated on the real test
+set — predicted vs. actual RUL (colored by late/early direction, since the
+scoring function treats them asymmetrically) and residuals vs. true RUL.
+Charts are trained and evaluated live with the same defaults as the
+corresponding binaries, so the numbers shown always match what those
+binaries themselves report.
 
 ## Dependency philosophy
 
-**The core pipeline (`core/`) has zero external dependencies** — including
-the Phase 4 flagship model and Phase 5's k-means/regime normalization —
-enforced structurally rather than by convention: `charts/` and `models/`
-are separate workspace members specifically so nothing charting- or
-ML-library-related can end up in core's dependency tree even by accident.
-Parsing, RUL labeling, windowed features, summary statistics, evaluation
-metrics, the regression tree and gradient boosting implementation,
-k-means clustering, and CLI argument handling are all hand-rolled. A CLI
-crate (`clap`) would normally be the idiomatic, unremarkable choice for
-argument parsing — but every CLI in this workspace has a small enough
-surface (one positional enum, a few flags) that `std::env::args()` covers
-it without pulling in a dependency for plumbing.
+The core pipeline (`core/`) has zero external dependencies — including the
+flagship model and the k-means/regime-normalization code — enforced
+structurally rather than by convention: `charts/`, `models/`, and
+`sequence/` are separate workspace members specifically so nothing
+charting-, ML-library-, or deep-learning-related can end up in `core`'s
+dependency tree even by accident. Parsing, RUL labeling, windowed
+features, summary statistics, evaluation metrics, the regression tree and
+gradient boosting implementation, k-means clustering, sequence extraction,
+and CLI argument handling are all hand-rolled — every CLI in this
+workspace has a small enough surface (one positional enum, a few flags)
+that `std::env::args()` covers it without a dependency for plumbing.
 
 `plotters` (in `charts/`) and `linfa`/`smartcore` (in `models/`) are the
-deliberate exceptions — the agreed hybrid approach: crates for
-well-understood, standard algorithms (linear regression, random forest,
-rendering pixels) where using a library isn't interesting or
-differentiating, hand-rolled code for the logic that is: RUL labeling, the
-PHM08 scoring function, feature engineering, and the flagship model itself.
+deliberate exceptions: crates for well-understood, standard algorithms
+(linear regression, random forest, rendering pixels) where a library isn't
+the interesting part, hand-rolled code for the logic that is — RUL
+labeling, the PHM08 scoring function, feature engineering, and the
+flagship model itself.
 
 ## Project structure
 
-This is a Cargo workspace with three members, split specifically so the
-`plotters`/`font-kit` graphics stack and the `linfa`/`smartcore` ML crates
-can't leak into the core pipeline's dependency graph (see
-[Dependency philosophy](#dependency-philosophy)):
+A Cargo workspace with four members, split so the `plotters`, `linfa`/
+`smartcore`, and `candle` dependency stacks can't leak into the core
+pipeline's dependency graph:
 
 ```
 cmapss-rul-prediction/
@@ -451,8 +407,8 @@ cmapss-rul-prediction/
 ├── data/
 │   ├── raw/CMAPSSData/         # the 12 original NASA files + readme (checked in)
 │   └── processed/              # labeled/windowed/prediction CSVs, generated by `cargo run` (gitignored)
-├── reports/figures/            # charts, generated by `cargo run -p charts` (gitignored)
-├── core/                        # the actual pipeline - zero external dependencies
+├── reports/figures/            # charts, generated by `cargo run -p charts`
+├── core/                        # the pipeline itself - zero external dependencies
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── main.rs               # CLI: argument parsing + report printing
@@ -461,30 +417,34 @@ cmapss-rul-prediction/
 │   │   ├── parser.rs              # raw line -> CycleRecord
 │   │   ├── loader.rs              # file I/O + grouping into EngineRun trajectories
 │   │   ├── rul.rs                  # piecewise-linear RUL labeling (train + test)
-│   │   ├── features.rs             # rolling-window feature engineering (Phase 2)
-│   │   ├── design_matrix.rs        # flat feature vectors for ML libraries (Phase 3)
-│   │   ├── scoring.rs               # RMSE + PHM08 asymmetric scoring function (Phase 3)
-│   │   ├── tree.rs                  # CART regression tree, hand-built (Phase 4)
-│   │   ├── boosting.rs               # gradient boosting on top of tree.rs (Phase 4)
-│   │   ├── kmeans.rs                  # k-means clustering, hand-built (Phase 5)
-│   │   ├── regime.rs                   # operating-regime normalization for FD002/FD004 (Phase 5)
+│   │   ├── features.rs             # rolling-window feature engineering
+│   │   ├── design_matrix.rs        # flat feature vectors for ML libraries
+│   │   ├── scoring.rs               # RMSE + PHM08 asymmetric scoring function
+│   │   ├── tree.rs                  # CART regression tree, hand-built
+│   │   ├── boosting.rs               # gradient boosting on top of tree.rs
+│   │   ├── kmeans.rs                  # k-means clustering, hand-built
+│   │   ├── regime.rs                   # operating-regime normalization for FD002/FD004
+│   │   ├── sequence.rs                  # raw sliding-window sequences for the LSTM
 │   │   ├── eda.rs                  # cycle-length, sensor-variance, sensor-RUL correlation
 │   │   └── error.rs                 # hand-rolled error type
-│   │   └── bin/flagship.rs           # Phase 4 flagship model CLI (auto-discovered by Cargo)
+│   │   └── bin/flagship.rs           # flagship model CLI (auto-discovered by Cargo)
 │   └── tests/data_integrity.rs   # integration tests against the real files
-├── charts/                       # sanity-check chart generation (plotters lives only here)
+├── charts/                       # chart generation (plotters lives only here)
 │   ├── Cargo.toml
 │   └── src/main.rs
-└── models/                       # baseline models (linfa + smartcore live only here)
+├── models/                       # baseline models (linfa + smartcore live only here)
+│   ├── Cargo.toml
+│   └── src/main.rs
+└── sequence/                     # LSTM sequence model (candle lives only here)
     ├── Cargo.toml
     └── src/main.rs
 ```
 
 ## Running it
 
-All commands below assume you're in the workspace root (this directory).
-Plain `cargo run`/`cargo build`/`cargo test` default to the core pipeline
-(no `-p` needed) — see the `default-members` note in the root `Cargo.toml`.
+All commands below assume you're in the workspace root. Plain `cargo run`/
+`cargo build`/`cargo test` default to the core pipeline (no `-p` needed) —
+see `default-members` in the root `Cargo.toml`.
 
 ```bash
 # Full report for all four subsets, writes labeled + windowed-feature CSVs to data/processed/
@@ -496,11 +456,11 @@ cargo run -- fd002 --report-only
 # Custom RUL cap or window size
 cargo run -- fd001 --rul-cap 130 --window 15
 
-# Sanity-check charts -> reports/figures/ (explicit -p: not a default member,
-# so plain `cargo build`/`cargo run` never touches its plotters/font-kit deps)
+# Charts -> reports/figures/ (explicit -p: not a default member, so plain
+# `cargo build`/`cargo run` never touches its dependencies)
 cargo run -p charts
 
-# Baseline models (explicit -p, same reason). Use --release - see Phase 3 section.
+# Baseline models (explicit -p, same reason). Use --release.
 cargo run -p models --release
 cargo run -p models --release -- fd003
 
@@ -508,32 +468,27 @@ cargo run -p models --release -- fd003
 cargo build -p cmapss-rul-prediction --bin flagship --release
 ./target/release/flagship
 ./target/release/flagship fd003
+
+# LSTM sequence model (experimental, unverified)
+cargo build -p sequence --release
+./target/release/sequence
 ```
 
 ## Testing
 
 ```bash
-# Defaults to the core pipeline - genuinely zero dependencies, fast, no graphics/ML stack involved
+# Defaults to the core pipeline - zero dependencies, fast
 cargo test
 ```
 
-57 tests (48 unit, 9 integration), all running against the real checked-in
-dataset (no synthetic fixtures for the integration tests) — unit-count
-sanity checks against the readme (including the corrected FD004 numbers),
-RUL monotonicity and cap enforcement, test-set RUL reconstruction against
-ground truth, full parse coverage across all 8 train/test files, window-size
-safety margin and structural leakage checks, scoring function correctness,
-feature-vector construction, regression tree split correctness and
-constraint enforcement, gradient boosting convergence/determinism, k-means
-clustering correctness/determinism, regime normalization correctness, and
-(new in Phase 5) empirical validation that k=6 finds genuinely separated,
-balanced regimes against real FD002/FD004 data.
-
-## Roadmap
-
-1. ~~Scaffold, data loading, RUL labeling, EDA~~ (Phase 1)
-2. ~~Feature engineering: rolling-window statistics per sensor per engine, run-aware to prevent cross-engine leakage~~ (Phase 2)
-3. ~~Baseline models (`linfa` linear regression, `smartcore` random forest), evaluated on RMSE and NASA's official asymmetric scoring function~~ (Phase 3)
-4. ~~Flagship model: gradient-boosted regression trees, hand-built from scratch~~ (Phase 4)
-5. ~~Generalization to FD002/FD004: operating-condition clustering + per-regime normalization~~ (this phase)
-6. *(stretch)* Sequence modeling (LSTM via `candle`/`burn`), the literature-standard approach for this dataset
+63 tests (54 unit, 9 integration), all running against the real checked-in
+dataset — unit-count sanity checks against the readme (including the
+corrected FD004 numbers), RUL monotonicity and cap enforcement, test-set
+RUL reconstruction against ground truth, full parse coverage across all 8
+train/test files, window-size safety-margin and structural leakage checks,
+scoring-function correctness, feature-vector construction, regression-tree
+split correctness and constraint enforcement, gradient-boosting
+convergence/determinism, k-means clustering correctness/determinism,
+regime-normalization correctness, empirical validation that `k=6` finds
+genuinely separated, balanced regimes against real FD002/FD004 data, and
+sequence-extraction correctness for the LSTM.

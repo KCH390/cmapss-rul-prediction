@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["core", "charts", "models"]
+members = ["core", "charts", "models", "sequence"]
 # Plain `cargo run` / `cargo build` / `cargo test` at the workspace root
 # target this by default, so the common case ("just run the pipeline")
-# doesn't need `-p`, and doesn't pull in charts' plotters/font-kit stack
-# unless you explicitly ask for it with `-p charts`.
+# doesn't need `-p`, and doesn't pull in charts'/models'/sequence's heavier
+# dependencies unless you explicitly ask for them with `-p`.
 default-members = ["core"]

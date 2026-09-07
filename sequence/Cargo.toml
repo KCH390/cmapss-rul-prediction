@@ -1,0 +1,21 @@
+[package]
+name = "sequence"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 6 (stretch): LSTM sequence model for cmapss-rul-prediction"
+
+[dependencies]
+cmapss-rul-prediction = { path = "../core" }
+# The literature-standard approach for this dataset (see README Roadmap).
+# Not hand-rolled: implementing backprop-through-time, an autodiff engine,
+# and a competitive optimizer from scratch is a different, much larger
+# project than this one - a real deep learning framework is the sensible
+# choice here the same way linfa/smartcore were for Phase 3's baselines.
+#
+# Pinned to 0.9 specifically: candle-core 0.5/0.6/0.7 resolve two
+# incompatible major versions of `rand` (0.8 and 0.9) simultaneously in
+# their own dependency graph, and `half`'s bf16/f16 types only implement
+# the sampling traits for one of them, which fails to compile. 0.9
+# resolves to a single, consistent rand version.
+candle-core = "0.9"
+candle-nn = "0.9"

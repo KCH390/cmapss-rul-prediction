@@ -10,6 +10,7 @@ pub mod parser;
 pub mod regime;
 pub mod rul;
 pub mod scoring;
+pub mod sequence;
 pub mod tree;
 
 pub use dataset::Subset;

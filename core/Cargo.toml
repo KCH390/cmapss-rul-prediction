@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Remaining Useful Life (RUL) prediction for NASA C-MAPSS turbofan engines"
 authors = ["Kerry"]
+# This package has two binaries: cmapss-rul (the main pipeline, src/main.rs)
+# and flagship (Phase 4's model, auto-discovered from src/bin/flagship.rs).
+# default-run picks cmapss-rul so plain `cargo run` at the workspace root
+# still runs the pipeline - `flagship` stays reachable via `--bin flagship`
+# or by running the built binary directly.
 default-run = "cmapss-rul"
 
 [dependencies]
