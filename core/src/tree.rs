@@ -105,6 +105,16 @@ fn build_node(
 /// Returns `None` if no split respects `min_samples_leaf` on both sides or
 /// every candidate split has zero or negative reduction (e.g. all targets
 /// in this node are already identical).
+///
+/// Performance note: this sorts a flat `Vec<(f64, f64, usize)>` of
+/// (feature value, target, original index) rather than sorting `indices`
+/// through a comparator that reaches back into `rows`/`targets` via double
+/// indirection (`rows[a][feature]`). The earlier version was correct but
+/// significantly slower in practice — sorting through indirection defeats
+/// cache locality on every single comparison, and profiling against real
+/// FD002 data (fitting 100 trees took ~70s for FD001 and was on track for
+/// 400+s for FD002's larger training set) made clear this was a real
+/// scaling problem, not just a constant-factor nicety.
 #[allow(clippy::type_complexity)]
 fn find_best_split(
     rows: &[Vec<f64>],
@@ -116,29 +126,33 @@ fn find_best_split(
     let n_features = rows[0].len();
 
     let total_sum: f64 = indices.iter().map(|&i| targets[i]).sum();
-    let total_sq: f64 = indices.iter().map(|&i| targets[i].powi(2)).sum();
+    let total_sq: f64 = indices.iter().map(|&i| targets[i] * targets[i]).sum();
     let sse_before = total_sq - total_sum * total_sum / n as f64;
 
     let mut best: Option<(f64, usize, f64)> = None; // (reduction, feature, threshold)
 
+    // Reused across features to avoid reallocating every iteration.
+    let mut sorted: Vec<(f64, f64, usize)> = Vec::with_capacity(n);
+
     for feature in 0..n_features {
-        let mut sorted: Vec<usize> = indices.to_vec();
-        sorted.sort_by(|&a, &b| rows[a][feature].partial_cmp(&rows[b][feature]).unwrap());
+        sorted.clear();
+        sorted.extend(indices.iter().map(|&i| (rows[i][feature], targets[i], i)));
+        sorted.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
         let mut left_sum = 0.0;
         let mut left_sq = 0.0;
 
         for pos in 0..(n - 1) {
-            let idx = sorted[pos];
-            left_sum += targets[idx];
-            left_sq += targets[idx].powi(2);
+            let (value, target, _idx) = sorted[pos];
+            left_sum += target;
+            left_sq += target * target;
             let left_n = pos + 1;
             let right_n = n - left_n;
 
             // Can't split between two samples with an identical feature
             // value - they'd end up on different sides of a threshold that
             // doesn't actually separate them.
-            if rows[sorted[pos]][feature] == rows[sorted[pos + 1]][feature] {
+            if value == sorted[pos + 1].0 {
                 continue;
             }
             if left_n < min_samples_leaf || right_n < min_samples_leaf {
@@ -156,7 +170,7 @@ fn find_best_split(
                 Some((best_reduction, _, _)) => reduction > best_reduction,
             };
             if better {
-                let threshold = (rows[sorted[pos]][feature] + rows[sorted[pos + 1]][feature]) / 2.0;
+                let threshold = (value + sorted[pos + 1].0) / 2.0;
                 best = Some((reduction, feature, threshold));
             }
         }

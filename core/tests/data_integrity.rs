@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use cmapss_rul::dataset::Subset;
 use cmapss_rul::features::{compute_windowed_features, DEFAULT_WINDOW};
 use cmapss_rul::loader::{group_by_unit, load_records, load_rul};
+use cmapss_rul::regime::fit_regimes;
 use cmapss_rul::rul::{label_test_rul, label_train_rul, DEFAULT_RUL_CAP};
 
 fn data_dir() -> PathBuf {
@@ -159,6 +160,40 @@ fn windowed_features_never_mix_two_engines() {
             features.iter().all(|f| f.unit == run.unit),
             "found a windowed row tagged with a different unit than its source run"
         );
+    }
+}
+
+#[test]
+fn regime_clustering_finds_six_well_separated_balanced_conditions_on_real_multi_condition_data() {
+    // Pins the empirical validation done during Phase 5 development: fitting
+    // k=6 on FD002/FD004's real operational settings should find genuinely
+    // separated, reasonably balanced regimes - not, say, one dominant
+    // cluster and five near-empty ones, which would mean the "6 operating
+    // conditions" premise this phase relies on doesn't actually hold up
+    // against the real data.
+    for subset in [Subset::FD002, Subset::FD004] {
+        let train_runs = group_by_unit(load_records(&subset.train_path(&data_dir())).unwrap());
+        let points: Vec<Vec<f64>> = train_runs
+            .iter()
+            .flat_map(|r| r.records.iter().map(|rec| rec.op_settings.to_vec()))
+            .collect();
+
+        let regimes = fit_regimes(&train_runs, 6);
+        let sizes = cmapss_rul::kmeans::cluster_sizes(&regimes, &points);
+        let total: usize = sizes.iter().sum();
+
+        assert_eq!(regimes.k(), 6);
+        assert_eq!(total, points.len());
+        for &size in &sizes {
+            let fraction = size as f64 / total as f64;
+            assert!(
+                fraction > 0.03,
+                "{}: a regime claimed only {:.1}% of cycles - suspiciously close to empty, \
+                 clustering may not have found 6 genuinely separated conditions",
+                subset,
+                fraction * 100.0
+            );
+        }
     }
 }
 

@@ -10,8 +10,8 @@ industrial reliability engineering — "how much running time is left before
 this fails" — which is a regression problem, not a classification one, and
 uses this repo to explore that in a systems language instead of Python.
 
-**Status: Phase 4 of 6 — flagship model (hand-built gradient-boosted trees).**
-See [Roadmap](#roadmap).
+**Status: Phase 5 of 6 — generalization to FD002/FD004 via operating-regime
+normalization.** See [Roadmap](#roadmap).
 
 ## Dataset
 
@@ -252,6 +252,132 @@ Writes `data/processed/{subset}_flagship_predictions.csv` and
 `{subset}_flagship_training_curve.csv` (training RMSE after each tree is
 added — see the Charting section for a plotted version).
 
+## Phase 5: generalizing to FD002/FD004
+
+Phase 1's EDA foreshadowed this: FD002/FD004 sweep 6 operating conditions,
+so a sensor that reads flat within one fixed condition (FD001/FD003)
+actually swings across conditions here — not from degradation, but from
+which flight regime the engine happens to be in. This phase adds:
+
+- **`core/src/kmeans.rs`** — k-means from scratch, with k-means++
+  initialization for reliable convergence and a hand-rolled seeded PRNG
+  (SplitMix64) so fitting is exactly reproducible, matching every other
+  deterministic guarantee this project makes.
+- **`core/src/regime.rs`** — fits k=6 regimes on the 3 operational settings
+  (k=1 for FD001/FD003, degenerating to harmless global standardization),
+  then z-scores every sensor against its assigned regime's **training-set**
+  mean/std. Regime stats are fit on training data only and reused unchanged
+  for test data — fitting on test data too would leak test-set information
+  into the transformation test predictions are later evaluated against.
+- Both add **zero new dependencies** — clustering is genuinely
+  differentiating logic (not plumbing), consistent with the project's hybrid
+  approach, and lives in `core` alongside the tree/boosting code.
+
+**Empirical validation, not just an assumption**: fitting k=6 on real FD002
+training data finds six cleanly separated regimes with clean round centroid
+values —
+
+```
+regime: centroid (op_setting_1, op_setting_2, op_setting_3)   count
+0.0015, 0.0005, 100.00   8044
+10.0030, 0.2505, 100.00   8096
+20.0030, 0.7005, 100.00   8122
+25.0030, 0.6205,  60.00   8002
+35.0030, 0.8405, 100.00   8037
+42.0030, 0.8405, 100.00  13458
+```
+
+— reasonably balanced (8000-8100 cycles each, one larger cluster at 13458,
+plausibly a more commonly-visited flight phase like cruise). This is
+pinned as a permanent integration test
+(`regime_clustering_finds_six_well_separated_balanced_conditions...`), not
+just a one-off check.
+
+### A real bug caught along the way
+
+The near-constant-sensor exclusion list (Phase 3's feature selection) was
+initially computed *after* normalization — but z-scoring always produces
+~unit variance from whatever it's given, so a sensor whose raw std sat just
+above the "treat as exactly zero" cutoff would get normalized into a
+full-variance column and silently stop being excluded, even though it's
+still physically uninformative. Fixed by computing the exclusion list from
+raw data, before normalization, in both `models` and `flagship`.
+
+### A real performance problem, also caught along the way
+
+Fitting the flagship model on FD001 (Phase 4's dataset) took **71 seconds**
+for 100 trees — genuinely too slow, not just inconvenient for a sandboxed
+tool call. The cause: `find_best_split` sorted sample indices through a
+comparator that reached back into the feature matrix via double indirection
+(`rows[a][feature]`) on every comparison, which defeats CPU cache locality
+across an O(n log n) sort repeated at every node of every tree. Rewriting
+it to sort flat `(value, target, index)` tuples directly — removing the
+indirection — gave a **4.9x speedup** (71s → 14.4s) with bit-identical
+output, confirmed by comparing predictions before and after.
+
+### Verifying the transform itself is correct
+
+With k=1 (FD001/FD003), regime normalization is pure global z-scoring — a
+per-feature affine transform that shouldn't change predictions from either
+OLS or a tree-based model, in exact arithmetic. Testing this directly on
+FD001:
+
+- **Linear regression: exactly invariant** (RMSE 20.45 either way,
+  identical to the displayed precision) — confirms OLS's textbook
+  scale-invariance.
+- **Tree-based models (both smartcore's random forest and our own
+  from-scratch, zero-randomness flagship GBM): small differences**
+  (flagship: RMSE 18.07 → 17.94). This isn't a bug and isn't randomness —
+  our GBM has none. Z-scoring introduces new floating-point rounding at
+  every value, and split search makes *discrete* branching decisions: a
+  candidate split that's an exact tie in real-number arithmetic can resolve
+  to a different (still valid, comparably good) split once floating-point
+  rounding breaks the tie differently. Smooth computations like OLS's
+  matrix solve don't have this sensitivity; discrete ones like tree
+  splitting do. Confirmed by testing our own deterministic implementation,
+  which ruled out randomness as the explanation.
+
+### Results: real, and honestly mixed
+
+Same evaluation methodology as Phase 3/4 throughout (one prediction per
+test engine, at its last recorded cycle). `--normalize` fits k=6 regimes
+and z-scores accordingly:
+
+| Subset | Model | RMSE (raw) | Score (raw) | RMSE (normalized) | Score (normalized) |
+|--------|-------|-----------:|-------------:|-------------------:|---------------------:|
+| FD002  | Linear regression      | 19.29 | 1764.8 | **18.64** | **1749.8** |
+| FD002  | Random forest          | 20.32 | 3290.0 | **17.49** | **1836.1** |
+| FD002  | Flagship GBM           | 18.68 | 2307.7 | **16.14** | **1451.3** |
+| FD004  | Linear regression      | 22.08 | 2665.8 | *fit failed* | *fit failed* |
+| FD004  | Random forest          | 20.29 | 3160.7 | **19.79** | 3369.2 |
+| FD004  | Flagship GBM           | 20.32 | 2628.9 | **18.95** | 3212.8 |
+
+**FD002 is a clean win** — normalization improves every model on every
+metric, most dramatically random forest's score (3290.0 → 1836.1, nearly
+halved).
+
+**FD004 is genuinely harder and the story is mixed, not swept under the
+rug**: RMSE improves for both tree-based models, but the PHM08 score gets
+*worse* for both (more/larger late-direction errors even as the average
+error drops — the same RMSE-vs-score tension from Phase 3/4, now showing up
+here too). And **linear regression fails to fit at all** on normalized
+FD004 — `linfa` returns a `NonInvertible` error, meaning the design matrix
+is genuinely singular. FD004 combines 6 conditions *and* 2 fault modes (the
+most complex of the four subsets), and per-regime z-scoring evidently
+introduces near-perfect collinearity between some features under that
+combination. `models` was made resilient to this (linear regression's
+failure is reported and skipped rather than crashing the whole run, so
+random forest's results are never lost to a sibling model's failure) rather
+than papering over it with regularization or dropping the comparison.
+
+Run it yourself:
+
+```bash
+cargo run -p models --release -- fd002 --normalize
+cargo build -p cmapss-rul-prediction --bin flagship --release
+./target/release/flagship fd004 --normalize
+```
+
 ## Charting
 
 Static sanity-check charts live in a separate `charts` crate — see
@@ -293,16 +419,17 @@ is the fallback - plain PNGs, zero notebook tooling, still 100% Rust.
 ## Dependency philosophy
 
 **The core pipeline (`core/`) has zero external dependencies** — including
-the Phase 4 flagship model — enforced structurally rather than by
-convention: `charts/` and `models/` are separate workspace members
-specifically so nothing charting- or ML-library-related can end up in
-core's dependency tree even by accident. Parsing, RUL labeling, windowed
-features, summary statistics, evaluation metrics, the regression tree and
-gradient boosting implementation, and CLI argument handling are all
-hand-rolled. A CLI crate (`clap`) would normally be the idiomatic,
-unremarkable choice for argument parsing — but every CLI in this workspace
-has a small enough surface (one positional enum, a few flags) that
-`std::env::args()` covers it without pulling in a dependency for plumbing.
+the Phase 4 flagship model and Phase 5's k-means/regime normalization —
+enforced structurally rather than by convention: `charts/` and `models/`
+are separate workspace members specifically so nothing charting- or
+ML-library-related can end up in core's dependency tree even by accident.
+Parsing, RUL labeling, windowed features, summary statistics, evaluation
+metrics, the regression tree and gradient boosting implementation,
+k-means clustering, and CLI argument handling are all hand-rolled. A CLI
+crate (`clap`) would normally be the idiomatic, unremarkable choice for
+argument parsing — but every CLI in this workspace has a small enough
+surface (one positional enum, a few flags) that `std::env::args()` covers
+it without pulling in a dependency for plumbing.
 
 `plotters` (in `charts/`) and `linfa`/`smartcore` (in `models/`) are the
 deliberate exceptions — the agreed hybrid approach: crates for
@@ -339,6 +466,8 @@ cmapss-rul-prediction/
 │   │   ├── scoring.rs               # RMSE + PHM08 asymmetric scoring function (Phase 3)
 │   │   ├── tree.rs                  # CART regression tree, hand-built (Phase 4)
 │   │   ├── boosting.rs               # gradient boosting on top of tree.rs (Phase 4)
+│   │   ├── kmeans.rs                  # k-means clustering, hand-built (Phase 5)
+│   │   ├── regime.rs                   # operating-regime normalization for FD002/FD004 (Phase 5)
 │   │   ├── eda.rs                  # cycle-length, sensor-variance, sensor-RUL correlation
 │   │   └── error.rs                 # hand-rolled error type
 │   │   └── bin/flagship.rs           # Phase 4 flagship model CLI (auto-discovered by Cargo)
@@ -388,21 +517,23 @@ cargo build -p cmapss-rul-prediction --bin flagship --release
 cargo test
 ```
 
-47 tests (39 unit, 8 integration), all running against the real checked-in
+57 tests (48 unit, 9 integration), all running against the real checked-in
 dataset (no synthetic fixtures for the integration tests) — unit-count
 sanity checks against the readme (including the corrected FD004 numbers),
 RUL monotonicity and cap enforcement, test-set RUL reconstruction against
 ground truth, full parse coverage across all 8 train/test files, window-size
 safety margin and structural leakage checks, scoring function correctness,
-feature-vector construction, and (new in Phase 4) regression tree split
-correctness, constraint enforcement, and gradient boosting convergence/
-determinism.
+feature-vector construction, regression tree split correctness and
+constraint enforcement, gradient boosting convergence/determinism, k-means
+clustering correctness/determinism, regime normalization correctness, and
+(new in Phase 5) empirical validation that k=6 finds genuinely separated,
+balanced regimes against real FD002/FD004 data.
 
 ## Roadmap
 
 1. ~~Scaffold, data loading, RUL labeling, EDA~~ (Phase 1)
 2. ~~Feature engineering: rolling-window statistics per sensor per engine, run-aware to prevent cross-engine leakage~~ (Phase 2)
 3. ~~Baseline models (`linfa` linear regression, `smartcore` random forest), evaluated on RMSE and NASA's official asymmetric scoring function~~ (Phase 3)
-4. ~~Flagship model: gradient-boosted regression trees, hand-built from scratch~~ (this phase)
-5. Generalization to FD002/FD004: operating-condition clustering + per-regime normalization, documented as an explicit extension (see EDA findings above)
+4. ~~Flagship model: gradient-boosted regression trees, hand-built from scratch~~ (Phase 4)
+5. ~~Generalization to FD002/FD004: operating-condition clustering + per-regime normalization~~ (this phase)
 6. *(stretch)* Sequence modeling (LSTM via `candle`/`burn`), the literature-standard approach for this dataset

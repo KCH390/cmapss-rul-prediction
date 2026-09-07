@@ -20,6 +20,7 @@ use cmapss_rul::design_matrix::{feature_names, to_feature_vector};
 use cmapss_rul::eda::{near_constant_sensors, sensor_stats};
 use cmapss_rul::features::{compute_windowed_features, DEFAULT_WINDOW};
 use cmapss_rul::loader::{group_by_unit, load_records, load_rul};
+use cmapss_rul::regime::{compute_regime_stats, fit_regimes, normalize_run};
 use cmapss_rul::rul::{label_test_rul, label_train_rul, DEFAULT_RUL_CAP};
 use cmapss_rul::scoring::{phm08_score, rmse};
 use cmapss_rul::tree::TreeParams;
@@ -34,6 +35,7 @@ struct Cli {
     min_samples_leaf: usize,
     data_dir: PathBuf,
     out_dir: PathBuf,
+    normalize: bool,
 }
 
 impl Cli {
@@ -48,6 +50,7 @@ impl Cli {
             min_samples_leaf: 20,
             data_dir: PathBuf::from("data/raw/CMAPSSData"),
             out_dir: PathBuf::from("data/processed"),
+            normalize: false,
         };
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
@@ -69,6 +72,7 @@ impl Cli {
                 "--min-samples-leaf" => parse_flag!(cli.min_samples_leaf, "--min-samples-leaf"),
                 "--data-dir" => cli.data_dir = PathBuf::from(args.next().ok_or("--data-dir requires a value")?),
                 "--out-dir" => cli.out_dir = PathBuf::from(args.next().ok_or("--out-dir requires a value")?),
+                "--normalize" => cli.normalize = true,
                 other if !other.starts_with('-') => cli.subset = Subset::from_str(other)?,
                 other => return Err(format!("unrecognized argument {:?}", other)),
             }
@@ -82,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("argument error: {}", e);
         eprintln!(
             "USAGE: flagship [SUBSET] [--n-trees N] [--learning-rate F] [--max-depth N] \
-             [--min-samples-leaf N] [--rul-cap N] [--window N] [--data-dir PATH] [--out-dir PATH]"
+             [--min-samples-leaf N] [--rul-cap N] [--window N] [--normalize] [--data-dir PATH] [--out-dir PATH]"
         );
         e
     })?;
@@ -93,9 +97,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.n_trees, cli.learning_rate, cli.max_depth, cli.min_samples_leaf
     );
 
-    let train_runs = group_by_unit(load_records(&cli.subset.train_path(&cli.data_dir))?);
-    let test_runs = group_by_unit(load_records(&cli.subset.test_path(&cli.data_dir))?);
+    let mut train_runs = group_by_unit(load_records(&cli.subset.train_path(&cli.data_dir))?);
+    let mut test_runs = group_by_unit(load_records(&cli.subset.test_path(&cli.data_dir))?);
     let test_rul = load_rul(&cli.subset.rul_path(&cli.data_dir))?;
+
+    // Near-constant sensors must be determined from RAW data, before any
+    // normalization - see models/src/main.rs for the full rationale (short
+    // version: z-scoring always produces ~unit variance from whatever it's
+    // given, so computing this on normalized data would silently stop
+    // excluding sensors that are still physically uninformative).
+    let excluded = near_constant_sensors(&sensor_stats(&train_runs));
+
+    if cli.normalize {
+        let k = cli.subset.num_conditions() as usize;
+        let regimes = fit_regimes(&train_runs, k);
+        let stats = compute_regime_stats(&train_runs, &regimes);
+        println!("fitted {} operating regime(s), training cycle counts per regime: {:?}", k, stats.counts);
+        train_runs = train_runs.iter().map(|r| normalize_run(r, &regimes, &stats)).collect();
+        test_runs = test_runs.iter().map(|r| normalize_run(r, &regimes, &stats)).collect();
+    }
 
     let train_labels: Vec<Vec<u32>> = train_runs.iter().map(|r| label_train_rul(r, cli.rul_cap)).collect();
     let test_labels: Vec<Vec<u32>> = test_runs
@@ -104,8 +124,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(r, &final_rul)| label_test_rul(r, final_rul, cli.rul_cap))
         .collect();
 
-    let stats = sensor_stats(&train_runs);
-    let excluded = near_constant_sensors(&stats);
     let names = feature_names(&excluded);
     println!("excluding near-constant sensors {:?}, {} features per row", excluded, names.len());
 
@@ -166,7 +184,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::fs::create_dir_all(&cli.out_dir)?;
-    let out_path = cli.out_dir.join(format!("{}_flagship_predictions.csv", cli.subset.code()));
+    let suffix = if cli.normalize { "_normalized" } else { "" };
+    let out_path = cli.out_dir.join(format!("{}_flagship_predictions{}.csv", cli.subset.code(), suffix));
     let mut csv = String::from("unit,true_rul,pred_flagship,error_flagship\n");
     for i in 0..test_units.len() {
         csv.push_str(&format!(

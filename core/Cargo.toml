@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Remaining Useful Life (RUL) prediction for NASA C-MAPSS turbofan engines"
 authors = ["Kerry"]
+default-run = "cmapss-rul"
 
 [dependencies]
 # Genuinely zero external dependencies: parsing, RUL labeling, windowed

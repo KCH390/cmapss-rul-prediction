@@ -31,6 +31,7 @@ use cmapss_rul::design_matrix::{feature_names, to_feature_vector};
 use cmapss_rul::eda::{near_constant_sensors, sensor_stats};
 use cmapss_rul::features::{compute_windowed_features, DEFAULT_WINDOW};
 use cmapss_rul::loader::{group_by_unit, load_records, load_rul};
+use cmapss_rul::regime::{compute_regime_stats, fit_regimes, normalize_run};
 use cmapss_rul::rul::{label_test_rul, label_train_rul, DEFAULT_RUL_CAP};
 use cmapss_rul::scoring::{phm08_score, rmse};
 
@@ -40,6 +41,7 @@ struct Cli {
     window: usize,
     data_dir: PathBuf,
     out_dir: PathBuf,
+    normalize: bool,
 }
 
 impl Cli {
@@ -50,6 +52,7 @@ impl Cli {
             window: DEFAULT_WINDOW,
             data_dir: PathBuf::from("data/raw/CMAPSSData"),
             out_dir: PathBuf::from("data/processed"),
+            normalize: false,
         };
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
@@ -70,6 +73,7 @@ impl Cli {
                 }
                 "--data-dir" => cli.data_dir = PathBuf::from(args.next().ok_or("--data-dir requires a value")?),
                 "--out-dir" => cli.out_dir = PathBuf::from(args.next().ok_or("--out-dir requires a value")?),
+                "--normalize" => cli.normalize = true,
                 other if !other.starts_with('-') => cli.subset = Subset::from_str(other)?,
                 other => return Err(format!("unrecognized argument {:?}", other)),
             }
@@ -81,16 +85,46 @@ impl Cli {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse(std::env::args().skip(1)).map_err(|e| {
         eprintln!("argument error: {}", e);
-        eprintln!("USAGE: models [SUBSET] [--rul-cap N] [--window N] [--data-dir PATH] [--out-dir PATH]");
+        eprintln!("USAGE: models [SUBSET] [--rul-cap N] [--window N] [--normalize] [--data-dir PATH] [--out-dir PATH]");
         e
     })?;
 
     println!("=== Phase 3 baseline models: {} ===", cli.subset);
 
     // --- Load, label, window (same pipeline as the core CLI) ---
-    let train_runs = group_by_unit(load_records(&cli.subset.train_path(&cli.data_dir))?);
-    let test_runs = group_by_unit(load_records(&cli.subset.test_path(&cli.data_dir))?);
+    let mut train_runs = group_by_unit(load_records(&cli.subset.train_path(&cli.data_dir))?);
+    let mut test_runs = group_by_unit(load_records(&cli.subset.test_path(&cli.data_dir))?);
     let test_rul = load_rul(&cli.subset.rul_path(&cli.data_dir))?;
+
+    // Determine near-constant sensors from RAW data, before any
+    // normalization. This has to happen first: z-scoring a sensor whose
+    // raw std sits just above regime.rs's own near-zero cutoff (used to
+    // avoid dividing by ~zero) turns tiny measurement noise into a
+    // full-unit-variance column by construction - z-scoring always
+    // produces ~unit variance for whatever it's given. Computing the
+    // exclusion list on normalized data would therefore silently stop
+    // excluding sensors that are still physically uninformative; "is this
+    // sensor near-constant" is a property of the raw signal, not an
+    // artifact of a later standardization step.
+    let excluded = near_constant_sensors(&sensor_stats(&train_runs));
+    println!(
+        "excluding {} near-constant sensor(s) (from raw data) from the feature set: {:?}",
+        excluded.len(),
+        excluded
+    );
+
+    if cli.normalize {
+        // Regime membership and normalization stats come from TRAINING data
+        // only, then get applied unchanged to both splits - fitting on test
+        // data too would leak test-set information into the transformation
+        // test predictions are later evaluated against.
+        let k = cli.subset.num_conditions() as usize;
+        let regimes = fit_regimes(&train_runs, k);
+        let stats = compute_regime_stats(&train_runs, &regimes);
+        println!("fitted {} operating regime(s), training cycle counts per regime: {:?}", k, stats.counts);
+        train_runs = train_runs.iter().map(|r| normalize_run(r, &regimes, &stats)).collect();
+        test_runs = test_runs.iter().map(|r| normalize_run(r, &regimes, &stats)).collect();
+    }
 
     let train_labels: Vec<Vec<u32>> = train_runs.iter().map(|r| label_train_rul(r, cli.rul_cap)).collect();
     let test_labels: Vec<Vec<u32>> = test_runs
@@ -102,13 +136,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Feature selection: drop sensors this subset's own training data
     // showed to be near-constant (Phase 1/2 EDA feeding directly into
     // Phase 3 modeling, not a disconnected step) ---
-    let stats = sensor_stats(&train_runs);
-    let excluded = near_constant_sensors(&stats);
-    println!(
-        "excluding {} near-constant sensor(s) from the feature set: {:?}",
-        excluded.len(),
-        excluded
-    );
     let names = feature_names(&excluded);
     println!("{} features per row: {:?}...", names.len(), &names[..names.len().min(6)]);
 
@@ -142,20 +169,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_features = x_train_rows[0].len();
 
     // === Linear regression (linfa) ===
+    // Fit failure is handled gracefully rather than aborting the whole run:
+    // OLS can hit a genuinely singular/near-singular design matrix (see the
+    // FD004 --normalize case in the README), and that's real, honest
+    // information about this model on this data - not a reason to also
+    // lose the random forest results below.
     let x_train_arr = Array2::from_shape_vec(
         (x_train_rows.len(), n_features),
         x_train_rows.iter().flatten().copied().collect(),
     )?;
     let y_train_arr = Array1::from_vec(y_train.clone());
     let dataset = Dataset::new(x_train_arr, y_train_arr);
-    let linear_model = LinearRegression::default().fit(&dataset)?;
-
     let x_test_arr = Array2::from_shape_vec(
         (x_test_rows.len(), n_features),
         x_test_rows.iter().flatten().copied().collect(),
     )?;
-    let linear_preds: Array1<f64> = linear_model.predict(&x_test_arr);
-    let linear_pairs: Vec<(f64, f64)> = linear_preds.iter().copied().zip(y_test.iter().copied()).collect();
+
+    let linear_result: Option<(Array1<f64>, Vec<(f64, f64)>)> =
+        match LinearRegression::default().fit(&dataset) {
+            Ok(model) => {
+                let preds: Array1<f64> = model.predict(&x_test_arr);
+                let pairs: Vec<(f64, f64)> = preds.iter().copied().zip(y_test.iter().copied()).collect();
+                Some((preds, pairs))
+            }
+            Err(e) => {
+                println!("\n--- Linear regression ---");
+                println!("FIT FAILED: {} (design matrix is singular or near-singular - see README)", e);
+                None
+            }
+        };
 
     // === Random forest (smartcore) ===
     let x_train_dm = DenseMatrix::from_2d_vec(&x_train_rows);
@@ -165,21 +207,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rf_pairs: Vec<(f64, f64)> = rf_preds.iter().copied().zip(y_test.iter().copied()).collect();
 
     // === Report ===
-    report("Linear regression", &linear_pairs);
+    if let Some((_, ref pairs)) = linear_result {
+        report("Linear regression", pairs);
+    }
     report("Random forest", &rf_pairs);
 
     // --- Predictions CSV ---
     std::fs::create_dir_all(&cli.out_dir)?;
-    let out_path = cli.out_dir.join(format!("{}_test_predictions.csv", cli.subset.code()));
+    let suffix = if cli.normalize { "_normalized" } else { "" };
+    let out_path = cli.out_dir.join(format!("{}_test_predictions{}.csv", cli.subset.code(), suffix));
     let mut csv = String::from("unit,true_rul,pred_linear,pred_rf,error_linear,error_rf\n");
     for i in 0..test_units.len() {
+        let (pred_linear, error_linear) = match &linear_result {
+            Some((preds, _)) => (preds[i].to_string(), (preds[i] - y_test[i]).to_string()),
+            None => ("NA".to_string(), "NA".to_string()),
+        };
         csv.push_str(&format!(
             "{},{},{},{},{},{}\n",
             test_units[i],
             y_test[i],
-            linear_preds[i],
+            pred_linear,
             rf_preds[i],
-            linear_preds[i] - y_test[i],
+            error_linear,
             rf_preds[i] - y_test[i],
         ));
     }
